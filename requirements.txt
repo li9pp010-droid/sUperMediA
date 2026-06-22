@@ -1,5 +1,4 @@
-aiogram
-aiohttp
-pydantic
+telethon
+cryptg
 yt-dlp
 static-ffmpeg

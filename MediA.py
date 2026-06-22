@@ -5,9 +5,8 @@ import re
 import random
 import secrets
 from concurrent.futures import ProcessPoolExecutor
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import ReactionEmoji
 import yt_dlp
 import static_ffmpeg
 
@@ -30,84 +29,96 @@ authorized_users = {}
 owner_states = {}
 url_cache = {}
 executor = ProcessPoolExecutor(max_workers=100)
-bot = Bot(token=os.environ.get("BOT_TOKEN", "your_bot_token_here"))
-dp = Dispatcher()
+
+API_ID = int(os.environ.get("TELEGRAM_API_ID", 123456))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "your_api_hash_here")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
+
+client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 def get_keypad(code="0000", mode="auth"):
     display_code = " ".join(list(code))
     keyboard = [
-        [InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"), InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2"), InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3")],
-        [InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4"), InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5"), InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6")],
-        [InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7"), InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8"), InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9")],
-        [InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete"), InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0"), InlineKeyboardButton(text="✅", callback_data=f"key_{mode}_verify")]
+        [Button.inline("1", f"key_{mode}_1"), Button.inline("2", f"key_{mode}_2"), Button.inline("3", f"key_{mode}_3")],
+        [Button.inline("4", f"key_{mode}_4"), Button.inline("5", f"key_{mode}_5"), Button.inline("6", f"key_{mode}_6")],
+        [Button.inline("7", f"key_{mode}_7"), Button.inline("8", f"key_{mode}_8"), Button.inline("9", f"key_{mode}_9")],
+        [Button.inline("⛔", f"key_{mode}_delete"), Button.inline("0", f"key_{mode}_0"), Button.inline("✅", f"key_{mode}_verify")]
     ]
     if mode == "change":
-        return f"عين الكود الافتراضي\n\n||{display_code}||", InlineKeyboardMarkup(inline_keyboard=keyboard)
-    return f"||{display_code}||", InlineKeyboardMarkup(inline_keyboard=keyboard)
+        return f"عين الكود الافتراضي\n\n{display_code}", keyboard
+    return f"{display_code}", keyboard
 
 def get_owner_panel():
-    keyboard = [
-        [InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code"), InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer")],
-        [InlineKeyboardButton(text="تعطيل الاونلاين", callback_data="owner_offline"), InlineKeyboardButton(text="تفعيل الاونلاين", callback_data="owner_online")]
+    return [
+        [Button.inline("تغيير الكود", "owner_change_code"), Button.inline("نقل ملكية البوت", "owner_transfer")],
+        [Button.inline("تعطيل الاونلاين", "owner_offline"), Button.inline("تفعيل الاونلاين", "owner_online")]
     ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_media_panel(url):
     token = secrets.token_hex(6)
     url_cache[token] = url
-    keyboard = [
-        [InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}"), InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}")],
-        [InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}"), InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}")]
+    return [
+        [Button.inline("فيديو", f"dl_video_{token}"), Button.inline("صوت", f"dl_audio_{token}")],
+        [Button.inline("صورة / البوم صور", f"dl_imgalbum_{token}"), Button.inline("فيديو / البوم فيديو", f"dl_vidalbum_{token}")]
     ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-async def send_slow_message(message: types.Message, text: str, reply_markup=None, reply_to_id=None, edit_msg_id=None):
-    lines = text.split('\n')
+async def send_slow_message(event, text, buttons=None, reply_to=None, edit_msg=None):
     chunks = []
-    for line in lines:
-        words = line.split()
-        for i in range(0, len(words), 2):
-            chunks.append(" ".join(words[i:i+2]))
-        if line != lines[-1]:
-            chunks.append("\n")
-            
-    target_id = reply_to_id if reply_to_id else message.message_id
+    remaining = text
+    add_words = True
+    
+    while remaining:
+        if add_words:
+            match = re.match(r'^(\s*\S+\s+\S+|\s*\S+)', remaining)
+            if match:
+                chunk = match.group(1)
+                chunks.append(chunk)
+                remaining = remaining[len(chunk):]
+            else:
+                break
+        else:
+            chunk = remaining[:2]
+            chunks.append(chunk)
+            remaining = remaining[2:]
+        add_words = not add_words
+
     current_text = ""
-    msg = None
+    msg = edit_msg
     
     for chunk in chunks:
-        if chunk == "\n":
-            current_text += "\n"
-            continue
-        current_text += (" " if current_text and not current_text.endswith("\n") else "") + chunk
-        
-        if edit_msg_id and not msg:
-            try:
-                await message.bot.edit_message_text(chat_id=message.chat.id, message_id=edit_msg_id, text=current_text)
-                msg = types.Message(message_id=edit_msg_id, date=message.date, chat=message.chat, from_user=message.from_user)
-            except:
-                msg = await message.bot.send_message(chat_id=message.chat.id, text=current_text, reply_to_message_id=target_id)
-        elif not msg:
-            msg = await message.bot.send_message(chat_id=message.chat.id, text=current_text, reply_to_message_id=target_id)
+        current_text += chunk
+        if not msg:
+            if reply_to:
+                msg = await event.reply(current_text)
+            else:
+                msg = await client.send_message(event.chat_id, current_text)
         else:
-            await asyncio.sleep(0.3)
-            await msg.edit_text(current_text, reply_markup=reply_markup)
+            await asyncio.sleep(0.1)
+            msg = await msg.edit(current_text, buttons=buttons)
             
-    if reply_markup and msg:
-        await msg.edit_reply_markup(reply_markup=reply_markup)
+    if buttons and msg:
+        msg = await msg.edit(current_text, buttons=buttons)
     return msg
 
-async def handle_reaction(message: types.Message, emoji: str):
+async def handle_reaction(event, emoji: str):
     await asyncio.sleep(3)
     try:
-        await message.react(reactions=[ReactionTypeEmoji(emoji=emoji)])
+        await client(functions.messages.SendReactionRequest(
+            peer=event.input_chat,
+            msg_id=event.id,
+            reaction=[ReactionEmoji(emoticon=emoji)]
+        ))
     except:
         pass
 
-async def handle_bot_self_reaction(message: types.Message):
+async def handle_bot_self_reaction(msg):
     emoji = random.choice(["🤣", "😭"])
     try:
-        await message.react(reactions=[ReactionTypeEmoji(emoji=emoji)])
+        await client(functions.messages.SendReactionRequest(
+            peer=msg.input_chat,
+            msg_id=msg.id,
+            reaction=[ReactionEmoji(emoticon=emoji)]
+        ))
     except:
         pass
 
@@ -129,8 +140,7 @@ def check_link_info(url, mode):
         except:
             return "error"
 
-def make_progress_hook(loop, bot_token, chat_id, message_id):
-    local_bot = Bot(token=bot_token)
+def make_progress_hook(loop, chat_id, message_id):
     last_percent = -1
     
     def hook(d):
@@ -144,13 +154,12 @@ def make_progress_hook(loop, bot_token, chat_id, message_id):
                     last_percent = percent
                     text = f"يتم تنفيذ طلبك عزيزي\nانتظر شويه {percent}%"
                     asyncio.run_coroutine_threadsafe(
-                        local_bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text),
+                        client.edit_message(chat_id, message_id, text),
                         loop
                     )
     return hook
 
-def process_media(url, user_id, mode, bot_token, reply_to_msg_id, chat_id, progress_hook=None):
-    local_bot = Bot(token=bot_token)
+def process_media(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=None):
     user_dir = os.path.join("downloads", str(user_id))
     os.makedirs(user_dir, exist_ok=True)
     
@@ -209,11 +218,8 @@ def process_media(url, user_id, mode, bot_token, reply_to_msg_id, chat_id, progr
                     shutil.rmtree(user_dir, ignore_errors=True)
                     return f"too_large:{size_mb}", None
                     
-                if mode == 'imgalbum' or new_file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                    doc_msg = asyncio.run(local_bot.send_photo(chat_id=chat_id, photo=types.FSInputFile(new_file_path), reply_to_message_id=reply_to_msg_id))
-                else:
-                    doc_msg = asyncio.run(local_bot.send_document(chat_id=chat_id, document=types.FSInputFile(new_file_path), reply_to_message_id=reply_to_msg_id))
-                last_file_msg_id = doc_msg.message_id
+                doc_msg = asyncio.run(client.send_file(chat_id, new_file_path, reply_to=reply_to_msg_id))
+                last_file_msg_id = doc_msg.id
                 
         shutil.rmtree(user_dir)
         return True, last_file_msg_id
@@ -222,202 +228,214 @@ def process_media(url, user_id, mode, bot_token, reply_to_msg_id, chat_id, progr
             shutil.rmtree(user_dir)
         return False, None
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+@client.on(events.NewMessage(pattern='/start'))
+async def cmd_start(event):
     global bot_owner, bot_online
-    if bot_owner is not None and message.from_user.id != bot_owner:
-        if not bot_online or not authorized_users.get(message.from_user.id, {}).get("verified", False):
+    user_id = event.sender_id
+    
+    if authorized_users.get(user_id, {}).get("verified", False):
+        await send_slow_message(event, MESSAGES["start"])
+        return
+        
+    if bot_owner is not None and user_id != bot_owner:
+        if not bot_online or not authorized_users.get(user_id, {}).get("verified", False):
             return
-    asyncio.create_task(handle_reaction(message, "🍓"))
-    authorized_users[message.from_user.id] = {"code": "", "verified": False}
+            
+    asyncio.create_task(handle_reaction(event, "🍓"))
+    authorized_users[user_id] = {"code": "", "verified": False}
     code_text, keyboard = get_keypad("0000", "auth")
-    await message.reply(code_text, reply_markup=keyboard, parse_mode="MarkdownV2")
+    await event.reply(code_text, buttons=keyboard)
 
-@dp.message(F.text == "ادت")
-async def owner_panel_cmd(message: types.Message):
-    if message.from_user.id != bot_owner:
+@client.on(events.NewMessage(func=lambda e: e.text == "ادت"))
+async def owner_panel_cmd(event):
+    if event.sender_id != bot_owner:
         return
-    asyncio.create_task(handle_reaction(message, "🍓"))
-    await message.reply(text=" ", reply_markup=get_owner_panel())
+    asyncio.create_task(handle_reaction(event, "🍓"))
+    await event.reply(" ", buttons=get_owner_panel())
 
-@dp.callback_query(F.data.startswith("owner_"))
-async def handle_owner_panel(callback: types.CallbackQuery):
+@client.on(events.CallbackQuery(data=re.compile(b"owner_")))
+async def handle_owner_panel(event):
     global bot_online, bot_owner
-    if callback.from_user.id != bot_owner:
+    if event.sender_id != bot_owner:
         return
-    action = callback.data.split("_")[1]
+    action = event.data.decode().split("_")[1]
     if action == "change":
         owner_states[bot_owner] = {"action": "changing_code", "code": ""}
         code_text, keyboard = get_keypad("0000", "change")
-        await callback.message.edit_text(code_text, reply_markup=keyboard, parse_mode="MarkdownV2")
+        await event.edit(code_text, buttons=keyboard)
     elif action == "transfer":
         owner_states[bot_owner] = {"action": "transferring"}
-        await callback.message.edit_text("دز ايدي المالك التريد\nتعينه")
+        await event.edit("دز ايدي المالك التريد\nتعينه")
     elif action == "offline":
         bot_online = False
-        await callback.message.edit_text("عطلته عن الكل مولاي وشغال\nبس عندك")
+        await event.edit("عطلته عن الكل مولاي وشغال\nبس عندك")
     elif action == "online":
         bot_online = True
-        await callback.message.edit_text("صار يشتغل للكل وتدلل يبعدي\nاوف مولاي")
+        await event.edit("صار يشتغل للكل وتدلل يبعدي\nاوف مولاي")
 
-@dp.callback_query(F.data.startswith("key_"))
-async def handle_keypad(callback: types.CallbackQuery):
+@client.on(events.CallbackQuery(data=re.compile(b"key_")))
+async def handle_keypad(event):
     global bot_owner, default_code
-    user_id = callback.from_user.id
-    parts = callback.data.split("_")
+    user_id = event.sender_id
+    parts = event.data.decode().split("_")
     mode = parts[1]
     action = parts[2]
+    
     if mode == "change" and user_id != bot_owner:
         return
+        
     if mode == "auth":
         if user_id not in authorized_users: authorized_users[user_id] = {"code": "", "verified": False}
         current_code = authorized_users[user_id]["code"]
     else:
         if user_id not in owner_states: owner_states[user_id] = {"action": "changing_code", "code": ""}
         current_code = owner_states[user_id]["code"]
+        
     if action.isdigit():
         if len(current_code) >= 4:
-            await callback.answer("الكود من اربعه ارقام", show_alert=True)
+            await event.answer("الكود من اربعه ارقام", alert=True)
             return
         current_code += action
         if mode == "auth": authorized_users[user_id]["code"] = current_code
         else: owner_states[user_id]["code"] = current_code
     elif action == "delete":
         if len(current_code) == 0:
-            await callback.answer("شنو امسح بعد عزيزي\nترى ماكو", show_alert=True)
+            await event.answer("شنو امسح بعد عزيزي\nترى ماكو", alert=True)
             return
         current_code = current_code[:-1]
         if mode == "auth": authorized_users[user_id]["code"] = current_code
         else: owner_states[user_id]["code"] = current_code
     elif action == "verify":
         if len(current_code) < 4:
-            await callback.answer("من المفروض ان الكود من اربعه ارقام عزيزي", show_alert=True)
+            await event.answer("من المفروض ان الكود من اربعه ارقام عزيزي", alert=True)
             return
         if mode == "auth":
             if current_code == default_code:
                 if bot_owner is None: bot_owner = user_id
                 authorized_users[user_id]["verified"] = True
-                await callback.message.edit_text(MESSAGES["auth_success"])
-                await send_slow_message(callback.message, MESSAGES["start"], reply_to_id=callback.message.reply_to_message.message_id if callback.message.reply_to_message else None)
+                await event.edit(MESSAGES["auth_success"])
+                await send_slow_message(event, MESSAGES["start"], reply_to=event.reply_to_msg_id)
                 return
             else:
                 authorized_users[user_id]["code"] = ""
-                await callback.message.edit_text(MESSAGES["auth_wrong"])
+                await event.edit(MESSAGES["auth_wrong"])
                 await asyncio.sleep(2)
                 code_text, keyboard = get_keypad("0000", "auth")
-                await callback.message.edit_text(code_text, reply_markup=keyboard, parse_mode="MarkdownV2")
+                await event.edit(code_text, buttons=keyboard)
                 return
         elif mode == "change":
             default_code = current_code
             owner_states.pop(user_id, None)
-            await callback.message.edit_text("تم تعيين الكود الافتراضي")
+            await event.edit("تم تعيين الكود الافتراضي")
             return
+            
     display = current_code.ljust(4, '0')
     code_text, keyboard = get_keypad(display, mode)
-    await callback.message.edit_text(code_text, reply_markup=keyboard, parse_mode="MarkdownV2")
+    await event.edit(code_text, buttons=keyboard)
 
-@dp.message()
-async def main_logic(message: types.Message):
+@client.on(events.NewMessage())
+async def main_logic(event):
     global bot_owner, bot_online
-    user_id = message.from_user.id
-    is_url = message.text.startswith(("http://", "https://")) if message.text else False
+    user_id = event.sender_id
+    if event.text and event.text.startswith('/start'):
+        return
+
+    is_url = event.text.startswith(("http://", "https://")) if event.text else False
     
     if bot_owner is not None and user_id == bot_owner:
-        if message.text and user_id in owner_states and owner_states[user_id].get("action") == "transferring":
-            asyncio.create_task(handle_reaction(message, "🍓"))
-            if message.text.isdigit():
-                new_owner = int(message.text)
+        if event.text and user_id in owner_states and owner_states[user_id].get("action") == "transferring":
+            asyncio.create_task(handle_reaction(event, "🍓"))
+            if event.text.isdigit():
+                new_owner = int(event.text)
                 bot_owner = new_owner
                 owner_states.pop(user_id, None)
                 if new_owner not in authorized_users: authorized_users[new_owner] = {}
                 authorized_users[new_owner]["verified"] = True
-                await message.reply("تم تعيين هذا المالك\nبدون مشاكل")
+                await event.reply("تم تعيين هذا المالك\nبدون مشاكل")
             else:
                 owner_states.pop(user_id, None)
-                await message.reply("دز ايدي المالك مو تمضرط وياي\nهوف داضوج")
+                await event.reply("دز ايدي المالك مو تمضرط وياي\nهوف داضوج")
             return
         if is_url:
-            asyncio.create_task(handle_reaction(message, "🍌"))
-            await send_slow_message(message, MESSAGES["received"], reply_markup=get_media_panel(message.text))
-        elif message.text:
-            asyncio.create_task(handle_reaction(message, "🍓"))
+            asyncio.create_task(handle_reaction(event, "🍌"))
+            await send_slow_message(event, MESSAGES["received"], buttons=get_media_panel(event.text))
+        elif event.text:
+            asyncio.create_task(handle_reaction(event, "🍓"))
         return
         
     if not bot_online: return
     if user_id not in authorized_users or not authorized_users[user_id].get("verified", False): return
     
     if is_url:
-        asyncio.create_task(handle_reaction(message, "🍌"))
-        await send_slow_message(message, MESSAGES["received"], reply_markup=get_media_panel(message.text))
-    elif message.text:
-        asyncio.create_task(handle_reaction(message, "🍓"))
+        asyncio.create_task(handle_reaction(event, "🍌"))
+        await send_slow_message(event, MESSAGES["received"], buttons=get_media_panel(event.text))
+    elif event.text:
+        asyncio.create_task(handle_reaction(event, "🍓"))
 
-@dp.callback_query(F.data.startswith("dl_"))
-async def handle_callback(callback: types.CallbackQuery):
+@client.on(events.CallbackQuery(data=re.compile(b"dl_")))
+async def handle_callback(event):
     global bot_owner, bot_online
-    user_id = callback.from_user.id
+    user_id = event.sender_id
+    
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        await event.edit(buttons=None)
     except:
         pass
         
     if bot_owner is not None and user_id != bot_owner:
         if not bot_online or not authorized_users.get(user_id, {}).get("verified", False):
             return
-    parts = callback.data.split("_")
+            
+    parts = event.data.decode().split("_")
     mode = parts[1]
     token = "_".join(parts[2:])
     
-    target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
+    target_reply_id = event.reply_to_msg_id if event.reply_to_msg_id else event.message_id
     
     url = url_cache.get(token)
     if not url:
-        await send_slow_message(callback.message, MESSAGES["error"], reply_to_id=target_reply_id)
+        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
         return
         
     loop = asyncio.get_event_loop()
     check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
     
     if check_result == "is_video_not_img":
-        await send_slow_message(callback.message, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to_id=target_reply_id)
+        await send_slow_message(event, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to=target_reply_id)
         return
     elif check_result == "not_album":
-        await send_slow_message(callback.message, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to_id=target_reply_id)
+        await send_slow_message(event, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to=target_reply_id)
         return
     elif check_result == "error":
-        await send_slow_message(callback.message, MESSAGES["error"], reply_to_id=target_reply_id)
+        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
         return
 
-    status_msg = await callback.message.reply("يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%")
+    status_msg = await event.reply("يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%")
     asyncio.create_task(handle_bot_self_reaction(status_msg))
     
-    progress_hook = make_progress_hook(loop, bot.token, callback.message.chat.id, status_msg.message_id)
+    progress_hook = make_progress_hook(loop, event.chat_id, status_msg.id)
     
     result, file_msg_id = await loop.run_in_executor(
-        executor, process_media, url, callback.from_user.id, mode, bot.token, 
-        target_reply_id, callback.message.chat.id, progress_hook
+        executor, process_media, url, user_id, mode, 
+        target_reply_id, event.chat_id, progress_hook
     )
     
     if result == True:
         try:
-            await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=status_msg.message_id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه")
+            await client.edit_message(event.chat_id, status_msg.id, "يتم تنفيذ طلبك عزيزي\nانتظر شويه")
         except:
             pass
         if file_msg_id:
-            fake_msg = types.Message(message_id=file_msg_id, date=status_msg.date, chat=status_msg.chat, from_user=status_msg.from_user)
-            await send_slow_message(fake_msg, MESSAGES["success"])
+            await send_slow_message(event, MESSAGES["success"])
     elif isinstance(result, str) and result.startswith("too_large:"):
         size_mb = result.split(":")[1]
         await send_slow_message(
-            callback.message,
+            event,
             MESSAGES["too_large"].format(size=f"{size_mb}MB"),
-            reply_to_id=target_reply_id
+            reply_to=target_reply_id
         )
     else:
-        await send_slow_message(callback.message, MESSAGES["error"], reply_to_id=target_reply_id)
-
-async def main():
-    await dp.start_polling(bot)
+        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    client.run_until_disconnected()
