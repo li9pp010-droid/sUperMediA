@@ -3,6 +3,7 @@ import shutil
 import asyncio
 import re
 import random
+import secrets
 from concurrent.futures import ProcessPoolExecutor
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
@@ -17,7 +18,7 @@ MESSAGES = {
     "received": "تم استلام الرابط عزيزي\nشلون تريده",
     "success": "تم تنفيذ طلبك بدون مشاكل\nاوف عزيزي",
     "error": "اكو مشكله فنيه بالبوت\nانتظر شويه",
-    "too_large": "عيرك ثكيل هواي وكسي مايكدر\nيشيله مولاي",
+    "too_large": "عيرك ثكيل هواي وكسي مايكدر\nيشيله مولاي {size}",
     "auth_success": "تم التعرف عليك عزيزي\nاوف تفضل",
     "auth_wrong": "كودك غلط فشل التعرف عليك\nمتطفل ابتعد"
 }
@@ -27,7 +28,8 @@ default_code = "9575"
 bot_online = True
 authorized_users = {}
 owner_states = {}
-executor = ProcessPoolExecutor(max_workers=300)
+url_cache = {}
+executor = ProcessPoolExecutor(max_workers=100)
 bot = Bot(token=os.environ.get("BOT_TOKEN", "your_bot_token_here"))
 dp = Dispatcher()
 
@@ -51,9 +53,11 @@ def get_owner_panel():
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_media_panel(url):
+    token = secrets.token_hex(6)
+    url_cache[token] = url
     keyboard = [
-        [InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{url}"), InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{url}")],
-        [InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{url}"), InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{url}")]
+        [InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}"), InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}")],
+        [InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}"), InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -201,7 +205,9 @@ def process_media(url, user_id, mode, bot_token, reply_to_msg_id, chat_id, progr
                 
                 filesize = os.path.getsize(new_file_path)
                 if filesize > 456 * 1024 * 1024:
-                    continue
+                    size_mb = round(filesize / (1024 * 1024), 1)
+                    shutil.rmtree(user_dir, ignore_errors=True)
+                    return f"too_large:{size_mb}", None
                     
                 if mode == 'imgalbum' or new_file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                     doc_msg = asyncio.run(local_bot.send_photo(chat_id=chat_id, photo=types.FSInputFile(new_file_path), reply_to_message_id=reply_to_msg_id))
@@ -350,15 +356,25 @@ async def main_logic(message: types.Message):
 async def handle_callback(callback: types.CallbackQuery):
     global bot_owner, bot_online
     user_id = callback.from_user.id
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except:
+        pass
+        
     if bot_owner is not None and user_id != bot_owner:
         if not bot_online or not authorized_users.get(user_id, {}).get("verified", False):
             return
     parts = callback.data.split("_")
     mode = parts[1]
-    url = "_".join(parts[2:])
+    token = "_".join(parts[2:])
     
     target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
     
+    url = url_cache.get(token)
+    if not url:
+        await send_slow_message(callback.message, MESSAGES["error"], reply_to_id=target_reply_id)
+        return
+        
     loop = asyncio.get_event_loop()
     check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
     
@@ -390,8 +406,13 @@ async def handle_callback(callback: types.CallbackQuery):
         if file_msg_id:
             fake_msg = types.Message(message_id=file_msg_id, date=status_msg.date, chat=status_msg.chat, from_user=status_msg.from_user)
             await send_slow_message(fake_msg, MESSAGES["success"])
-    elif result == "too_large":
-        await send_slow_message(callback.message, MESSAGES["too_large"], reply_to_id=target_reply_id)
+    elif isinstance(result, str) and result.startswith("too_large:"):
+        size_mb = result.split(":")[1]
+        await send_slow_message(
+            callback.message,
+            MESSAGES["too_large"].format(size=f"{size_mb}MB"),
+            reply_to_id=target_reply_id
+        )
     else:
         await send_slow_message(callback.message, MESSAGES["error"], reply_to_id=target_reply_id)
 
