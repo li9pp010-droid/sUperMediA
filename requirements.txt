@@ -1,0 +1,5 @@
+aiogram
+aiohttp
+pydantic
+yt-dlp
+static-ffmpeg
