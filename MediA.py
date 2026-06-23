@@ -482,7 +482,6 @@ async def owner_panel_cmd(message: Message):
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
     
     await delete_old_panel(message.chat.id, message.from_user.id, last_owner_panels)
-    # تعديل نص اللوحة هنا إلى "اعدادات المالك"
     await send_slow_message(message.chat.id, "اعدادات المالك", buttons=get_owner_panel(), reply_to_message_id=message.message_id, panel_type=last_owner_panels, user_id=message.from_user.id)
 
 @dp.callback_query(F.data.startswith('owner_'))
@@ -592,8 +591,11 @@ async def handle_keypad(callback: CallbackQuery):
                     
                 ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
                 
-                reset_msg_count(user_id)
                 await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], reply_to_message_id=ref_id)
+                
+                reset_msg_count(user_id)
+                if callback.message.reply_to_message:
+                    await main_logic(callback.message.reply_to_message)
                 return
             else:
                 owner_states[user_id]["code"] = ""
@@ -684,6 +686,7 @@ async def main_logic(message: Message):
     else:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         
+        # بعد التحقق: إرسال الرسائل العشوائية المرتبة للمستخدم الموثق مباشرة وبشكل متكرر
         if auth_data["msg_count"] == 0:
             await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
             increment_msg_count(user_id)
