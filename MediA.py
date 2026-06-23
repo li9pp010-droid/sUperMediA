@@ -12,7 +12,7 @@ import static_ffmpeg
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ButtonStyle
 
 ffmpeg_path = static_ffmpeg.add_paths(weak=True)
 
@@ -93,24 +93,24 @@ def reset_all_users_except_owner():
 def get_keypad(mode="auth", current_code=""):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"),
-            InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2"),
-            InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3")
+            InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3", style=ButtonStyle.PRIMARY)
         ],
         [
-            InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4"),
-            InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5"),
-            InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6")
+            InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6", style=ButtonStyle.PRIMARY)
         ],
         [
-            InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7"),
-            InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8"),
-            InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9")
+            InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9", style=ButtonStyle.PRIMARY)
         ],
         [
-            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete"),
-            InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0"),
-            InlineKeyboardButton(text="تم", callback_data=f"key_{mode}_verify")
+            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete", style=ButtonStyle.DANGER),
+            InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="✅", callback_data=f"key_{mode}_verify", style=ButtonStyle.SUCCESS)
         ]
     ])
     
@@ -121,15 +121,20 @@ def get_keypad(mode="auth", current_code=""):
 
 def get_owner_panel():
     global bot_online
-    online_text = "تعطيل الاونلاين" if bot_online else "تفعيل الاونلاين"
+    if bot_online:
+        online_text = "تعطيل الاونلاين"
+        online_style = ButtonStyle.DANGER
+    else:
+        online_text = "تفعيل الاونلاين"
+        online_style = ButtonStyle.SUCCESS
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code"),
-            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer")
+            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code", style=ButtonStyle.DANGER),
+            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer", style=ButtonStyle.DANGER)
         ],
         [
-            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online")
+            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online", style=online_style)
         ]
     ])
 
@@ -138,22 +143,90 @@ def get_media_panel(url):
     url_cache[token] = url
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}"),
-            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}")
+            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}", style=ButtonStyle.PRIMARY)
         ],
         [
-            InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}"),
-            InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}")
+            InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}", style=ButtonStyle.DANGER),
+            InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}", style=ButtonStyle.DANGER)
         ]
     ])
 
-async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None):
+def split_text_pattern(text):
+    tokens = re.split(r'(\s+)', text)
+    chunks = []
+    i = 0
+    pattern_words = True
+    
+    while i < len(tokens):
+        current_chunk = ""
+        if pattern_words:
+            word_count = 0
+            while i < len(tokens) and word_count < 2:
+                token = tokens[i]
+                current_chunk += token
+                if token.strip():
+                    word_count += 1
+                i += 1
+            pattern_words = False
+        else:
+            char_count = 0
+            while i < len(tokens) and char_count < 3:
+                token = tokens[i]
+                if not token.strip():
+                    current_chunk += token
+                    i += 1
+                    continue
+                available = 3 - char_count
+                if len(token) <= available:
+                    current_chunk += token
+                    char_count += len(token)
+                    i += 1
+                else:
+                    current_chunk += token[:available]
+                    tokens[i] = token[available:]
+                    char_count += available
+            pattern_words = True
+        if current_chunk:
+            chunks.append(current_chunk)
+    return chunks
+
+async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, fast=False):
     kwargs = {}
     if reply_to_message_id:
         kwargs['reply_to_message_id'] = reply_to_message_id
         
-    res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
-    return res.message_id
+    if fast or not text.strip():
+        res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
+        return res.message_id
+
+    chunks = split_text_pattern(text)
+    if not chunks:
+        res = await bot.send_message(chat_id=chat_id, text=" ", reply_markup=buttons, **kwargs)
+        return res.message_id
+
+    current_text = chunks[0]
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=current_text, **kwargs)
+    except:
+        res = await bot.send_message(chat_id=chat_id, text=text, reply_markup=buttons, **kwargs)
+        return res.message_id
+
+    for chunk in chunks[1:]:
+        await asyncio.sleep(0.03)
+        current_text += chunk
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=current_text)
+        except:
+            pass
+
+    if buttons:
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg.message_id, reply_markup=buttons)
+        except:
+            pass
+
+    return msg.message_id
 
 async def handle_reaction(chat_id, message_id, emoji: str):
     await asyncio.sleep(3)
@@ -322,7 +395,7 @@ async def cmd_start(message: Message):
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
     owner_states[user_id] = {"action": "auth", "code": ""}
     code_text, keyboard = get_keypad("auth", "")
-    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id)
+    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
@@ -340,13 +413,21 @@ async def handle_owner_panel(callback: CallbackQuery):
     if action == "change":
         owner_states[bot_owner] = {"action": "change", "code": ""}
         code_text, keyboard = get_keypad("change", "")
-        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id)
+        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id, fast=True)
     elif action == "transfer":
         owner_states[bot_owner] = {"action": "transferring"}
         await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", reply_to_message_id=callback.message.message_id)
     elif action == "toggle":
         bot_online = not bot_online
         set_config("bot_online", str(bot_online))
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+                reply_markup=get_owner_panel()
+            )
+        except:
+            pass
         if bot_online:
             await send_slow_message(callback.message.chat.id, "صار يشتغل للكل وتدلل يبعدي\nاوف مولاي", reply_to_message_id=callback.message.message_id)
         else:
@@ -483,7 +564,7 @@ async def main_logic(message: Message):
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
         owner_states[user_id] = {"action": "auth", "code": ""}
         code_text, keyboard = get_keypad("auth", "")
-        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id)
+        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
         return
 
     if not bot_online:
