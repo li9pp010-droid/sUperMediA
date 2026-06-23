@@ -4,11 +4,15 @@ import asyncio
 import re
 import random
 import secrets
+import sqlite3
 from concurrent.futures import ProcessPoolExecutor
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import ReactionEmoji
 import yt_dlp
 import static_ffmpeg
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 ffmpeg_path = static_ffmpeg.add_paths(weak=True)
 
@@ -22,47 +26,130 @@ MESSAGES = {
     "auth_wrong": "كودك غلط فشل التعرف عليك\nمتطفل ابتعد"
 }
 
-bot_owner = None
-default_code = "9575"
-bot_online = True
-authorized_users = {}
+if os.path.exists("downloads"):
+    try:
+        shutil.rmtree("downloads")
+    except:
+        pass
+os.makedirs("downloads", exist_ok=True)
+
+conn = sqlite3.connect("bot_data.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("PRAGMA journal_mode=WAL")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    verified INTEGER DEFAULT 0
+)
+""")
+conn.commit()
+
+def get_config(key, default=None):
+    cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+def set_config(key, value):
+    cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+
+bot_owner = get_config("bot_owner")
+if bot_owner:
+    bot_owner = int(bot_owner)
+default_code = get_config("default_code", "9575")
+bot_online = get_config("bot_online", "True") == "True"
+
 owner_states = {}
 url_cache = {}
-executor = ProcessPoolExecutor(max_workers=100)
+active_downloads = set()
+executor = ProcessPoolExecutor(max_workers=18)
 
-API_ID = int(os.environ.get("TELEGRAM_API_ID", 123456))
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "your_api_hash_here")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 
-client = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+def load_user_auth(user_id):
+    cursor.execute("SELECT verified FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    if row:
+        return {"code": "", "verified": bool(row[0])}
+    return {"code": "", "verified": False}
+
+def save_user_auth(user_id, verified):
+    cursor.execute("INSERT OR REPLACE INTO users (user_id, verified) VALUES (?, ?)", (user_id, 1 if verified else 0))
+    conn.commit()
+
+def reset_all_users_except_owner():
+    cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
+    conn.commit()
 
 def get_keypad(code="0000", mode="auth"):
     display_code = " ".join(list(code))
-    keyboard = [
-        [Button.inline("1", f"key_{mode}_1"), Button.inline("2", f"key_{mode}_2"), Button.inline("3", f"key_{mode}_3")],
-        [Button.inline("4", f"key_{mode}_4"), Button.inline("5", f"key_{mode}_5"), Button.inline("6", f"key_{mode}_6")],
-        [Button.inline("7", f"key_{mode}_7"), Button.inline("8", f"key_{mode}_8"), Button.inline("9", f"key_{mode}_9")],
-        [Button.inline("⛔", f"key_{mode}_delete"), Button.inline("0", f"key_{mode}_0"), Button.inline("✅", f"key_{mode}_verify")]
-    ]
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"),
+            InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2"),
+            InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3")
+        ],
+        [
+            InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4"),
+            InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5"),
+            InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6")
+        ],
+        [
+            InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7"),
+            InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8"),
+            InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9")
+        ],
+        [
+            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete", style="danger"),
+            InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0"),
+            InlineKeyboardButton(text="تم", callback_data=f"key_{mode}_verify", style="success")
+        ]
+    ])
+    
     if mode == "change":
         return f"عين الكود الافتراضي\n\n{display_code}", keyboard
     return f"{display_code}", keyboard
 
 def get_owner_panel():
-    return [
-        [Button.inline("تغيير الكود", "owner_change_code"), Button.inline("نقل ملكية البوت", "owner_transfer")],
-        [Button.inline("تعطيل الاونلاين", "owner_offline"), Button.inline("تفعيل الاونلاين", "owner_online")]
-    ]
+    global bot_online
+    online_text = "تعطيل الاونلاين" if bot_online else "تفعيل الاونلاين"
+    online_style = "success" if bot_online else "danger"
+    
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code"),
+            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer")
+        ],
+        [
+            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online", style=online_style)
+        ]
+    ])
 
 def get_media_panel(url):
     token = secrets.token_hex(6)
     url_cache[token] = url
-    return [
-        [Button.inline("فيديو", f"dl_video_{token}"), Button.inline("صوت", f"dl_audio_{token}")],
-        [Button.inline("صورة / البوم صور", f"dl_imgalbum_{token}"), Button.inline("فيديو / البوم فيديو", f"dl_vidalbum_{token}")]
-    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}", style="success"),
+            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}"),
+            InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}")
+        ]
+    ])
 
-async def send_slow_message(event, text, buttons=None, reply_to=None, edit_msg=None):
+async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, edit_message_id=None):
     chunks = []
     remaining = text
     add_words = True
@@ -83,42 +170,51 @@ async def send_slow_message(event, text, buttons=None, reply_to=None, edit_msg=N
         add_words = not add_words
 
     current_text = ""
-    msg = edit_msg
+    msg_id = edit_message_id
     
     for chunk in chunks:
         current_text += chunk
-        if not msg:
-            if reply_to:
-                msg = await event.reply(current_text)
+        if not current_text.strip():
+            current_text = " "
+        try:
+            if not msg_id:
+                kwargs = {}
+                if reply_to_message_id:
+                    kwargs['reply_to_message_id'] = reply_to_message_id
+                res = await bot.send_message(chat_id=chat_id, text=current_text, **kwargs)
+                msg_id = res.message_id
             else:
-                msg = await client.send_message(event.chat_id, current_text)
-        else:
-            await asyncio.sleep(0.1)
-            msg = await msg.edit(current_text, buttons=buttons)
+                await asyncio.sleep(0.1)
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=current_text, reply_markup=buttons)
+        except Exception:
+            pass
             
-    if buttons and msg:
-        msg = await msg.edit(current_text, buttons=buttons)
-    return msg
+    if buttons and msg_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=current_text if current_text.strip() else " ", reply_markup=buttons)
+        except Exception:
+            pass
+    return msg_id
 
-async def handle_reaction(event, emoji: str):
+async def handle_reaction(chat_id, message_id, emoji: str):
     await asyncio.sleep(3)
     try:
-        await client(functions.messages.SendReactionRequest(
-            peer=event.input_chat,
-            msg_id=event.id,
-            reaction=[ReactionEmoji(emoticon=emoji)]
-        ))
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)]
+        )
     except:
         pass
 
-async def handle_bot_self_reaction(msg):
+async def handle_bot_self_reaction(chat_id, message_id):
     emoji = random.choice(["🤣", "😭"])
     try:
-        await client(functions.messages.SendReactionRequest(
-            peer=msg.input_chat,
-            msg_id=msg.id,
-            reaction=[ReactionEmoji(emoticon=emoji)]
-        ))
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)]
+        )
     except:
         pass
 
@@ -130,8 +226,10 @@ def check_link_info(url, mode):
             if not info:
                 return "error"
             is_playlist = 'entries' in info or info.get('_type') == 'playlist'
+            
             if mode == 'imgalbum':
-                if not is_playlist and not info.get('ext') in ['jpg', 'jpeg', 'png', 'webp']:
+                ext = info.get('ext', '').lower()
+                if not is_playlist and ext and ext not in ['jpg', 'jpeg', 'png', 'webp']:
                     return "is_video_not_img"
             if mode in ['imgalbum', 'vidalbum']:
                 if not is_playlist:
@@ -154,13 +252,13 @@ def make_progress_hook(loop, chat_id, message_id):
                     last_percent = percent
                     text = f"يتم تنفيذ طلبك عزيزي\nانتظر شويه {percent}%"
                     asyncio.run_coroutine_threadsafe(
-                        client.edit_message(chat_id, message_id, text),
+                        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text),
                         loop
                     )
     return hook
 
-def process_media(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=None):
-    user_dir = os.path.join("downloads", str(user_id))
+async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=None):
+    user_dir = os.path.join("downloads", f"{user_id}_{secrets.token_hex(4)}")
     os.makedirs(user_dir, exist_ok=True)
     
     ydl_opts = {
@@ -177,7 +275,12 @@ def process_media(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=No
         ydl_opts.update({
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(user_dir, '%(uploader)s - %(title)s.%(ext)s'),
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'best'}],
+            'postprocessors': [
+                {
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3'
+                }
+            ],
         })
     elif mode == 'imgalbum':
         ydl_opts.update({
@@ -188,254 +291,310 @@ def process_media(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=No
         })
     else:
         ydl_opts.update({
-            'format': 'bestvideo+bestaudio/best' if mode == 'video' else 'best',
+            'format': 'best',
             'outtmpl': os.path.join(user_dir, '%(uploader)s - %(title)s.%(ext)s'),
         })
         
+    loop = asyncio.get_running_loop()
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
+        def download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+        
+        await loop.run_in_executor(executor, download)
+        
+        files = []
+        for root, _, filenames in os.walk(user_dir):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+                
+        if not files:
+            return False, None
             
-            files = []
-            for root, _, filenames in os.walk(user_dir):
-                for filename in filenames:
-                    files.append(os.path.join(root, filename))
-                    
-            if not files:
-                return False, None
+        last_file_msg_id = None
+        sorted_files = sorted(files)
+        
+        for file_path in sorted_files:
+            dir_name = os.path.dirname(file_path)
+            base_name = os.path.basename(file_path)
+            
+            name_part, ext_part = os.path.splitext(base_name)
+            
+            clean_name = re.sub(r'[\\/:*?"<>|#]', ' ', name_part)
+            clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+            
+            new_file_path = os.path.join(dir_name, f"{clean_name}{ext_part}")
+            os.rename(file_path, new_file_path)
+            
+            filesize = os.path.getsize(new_file_path)
+            if filesize > 456 * 1024 * 1024:
+                size_mb = round(filesize / (1024 * 1024), 1)
+                return f"too_large:{size_mb}", None
                 
-            last_file_msg_id = None
-            for file_path in sorted(files):
-                base_name = os.path.basename(file_path)
-                clean_name = re.sub(r'[\\/:*?"<>|#]', ' ', base_name)
-                clean_name = re.sub(r'\s+', ' ', clean_name).strip()
-                new_file_path = os.path.join(os.path.dirname(file_path), clean_name)
-                os.rename(file_path, new_file_path)
-                
-                filesize = os.path.getsize(new_file_path)
-                if filesize > 456 * 1024 * 1024:
-                    size_mb = round(filesize / (1024 * 1024), 1)
-                    shutil.rmtree(user_dir, ignore_errors=True)
-                    return f"too_large:{size_mb}", None
-                    
-                doc_msg = asyncio.run(client.send_file(chat_id, new_file_path, reply_to=reply_to_msg_id))
-                last_file_msg_id = doc_msg.id
-                
-        shutil.rmtree(user_dir)
+            from aiogram.types import FSInputFile
+            input_file = FSInputFile(new_file_path)
+            doc_msg = await bot.send_document(chat_id=chat_id, document=input_file, reply_to_message_id=reply_to_msg_id)
+            last_file_msg_id = doc_msg.message_id
+            
         return True, last_file_msg_id
     except:
-        if os.path.exists(user_dir):
-            shutil.rmtree(user_dir)
         return False, None
+    finally:
+        if os.path.exists(user_dir):
+            try:
+                shutil.rmtree(user_dir)
+            except:
+                pass
 
-@client.on(events.NewMessage(pattern='/start'))
-async def cmd_start(event):
+@dp.message(F.text == '/start')
+async def cmd_start(message: Message):
     global bot_owner, bot_online
-    user_id = event.sender_id
+    user_id = message.from_user.id
     
-    if authorized_users.get(user_id, {}).get("verified", False):
-        await send_slow_message(event, MESSAGES["start"])
+    auth_data = load_user_auth(user_id)
+    if auth_data["verified"]:
+        await send_slow_message(message.chat.id, MESSAGES["start"])
         return
         
     if bot_owner is not None and user_id != bot_owner:
-        if not bot_online or not authorized_users.get(user_id, {}).get("verified", False):
+        if not bot_online:
             return
             
-    asyncio.create_task(handle_reaction(event, "🍓"))
-    authorized_users[user_id] = {"code": "", "verified": False}
+    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+    owner_states.pop(user_id, None)
     code_text, keyboard = get_keypad("0000", "auth")
-    await event.reply(code_text, buttons=keyboard)
+    await send_slow_message(message.chat.id, code_text, buttons=keyboard)
 
-@client.on(events.NewMessage(func=lambda e: e.text == "ادت"))
-async def owner_panel_cmd(event):
-    if event.sender_id != bot_owner:
-        return
-    asyncio.create_task(handle_reaction(event, "🍓"))
-    await event.reply(" ", buttons=get_owner_panel())
+@dp.message(F.text == 'ادت')
+async def owner_panel_cmd(message: Message):
+    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+    await send_slow_message(message.chat.id, " ", buttons=get_owner_panel())
 
-@client.on(events.CallbackQuery(data=re.compile(b"owner_")))
-async def handle_owner_panel(event):
+@dp.callback_query(F.data.startswith('owner_'))
+async def handle_owner_panel(callback: CallbackQuery):
     global bot_online, bot_owner
-    if event.sender_id != bot_owner:
+    if callback.from_user.id != bot_owner:
+        await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
-    action = event.data.decode().split("_")[1]
+        
+    action = callback.data.split("_")[1]
     if action == "change":
         owner_states[bot_owner] = {"action": "changing_code", "code": ""}
         code_text, keyboard = get_keypad("0000", "change")
-        await event.edit(code_text, buttons=keyboard)
+        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
     elif action == "transfer":
         owner_states[bot_owner] = {"action": "transferring"}
-        await event.edit("دز ايدي المالك التريد\nتعينه")
-    elif action == "offline":
-        bot_online = False
-        await event.edit("عطلته عن الكل مولاي وشغال\nبس عندك")
-    elif action == "online":
-        bot_online = True
-        await event.edit("صار يشتغل للكل وتدلل يبعدي\nاوف مولاي")
+        await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", edit_message_id=callback.message.message_id)
+    elif action == "toggle":
+        bot_online = not bot_online
+        set_config("bot_online", str(bot_online))
+        if bot_online:
+            await send_slow_message(callback.message.chat.id, "صار يشتغل للكل وتدلل يبعدي\nاوف مولاي", edit_message_id=callback.message.message_id, buttons=get_owner_panel())
+        else:
+            await send_slow_message(callback.message.chat.id, "عطلته عن الكل مولاي وشغال\nبس عندك", edit_message_id=callback.message.message_id, buttons=get_owner_panel())
+    await callback.answer()
 
-@client.on(events.CallbackQuery(data=re.compile(b"key_")))
-async def handle_keypad(event):
+@dp.callback_query(F.data.startswith('key_'))
+async def handle_keypad(callback: CallbackQuery):
     global bot_owner, default_code
-    user_id = event.sender_id
-    parts = event.data.decode().split("_")
+    user_id = callback.from_user.id
+    parts = callback.data.split("_")
     mode = parts[1]
     action = parts[2]
     
     if mode == "change" and user_id != bot_owner:
+        await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
     if mode == "auth":
-        if user_id not in authorized_users: authorized_users[user_id] = {"code": "", "verified": False}
-        current_code = authorized_users[user_id]["code"]
+        if user_id not in owner_states:
+            owner_states[user_id] = {"action": "auth", "code": ""}
+        current_code = owner_states[user_id]["code"]
     else:
-        if user_id not in owner_states: owner_states[user_id] = {"action": "changing_code", "code": ""}
+        if user_id not in owner_states:
+            owner_states[user_id] = {"action": "changing_code", "code": ""}
         current_code = owner_states[user_id]["code"]
         
     if action.isdigit():
         if len(current_code) >= 4:
-            await event.answer("الكود من اربعه ارقام", alert=True)
+            await callback.answer("الكود من اربعه ارقام", show_alert=True)
             return
         current_code += action
-        if mode == "auth": authorized_users[user_id]["code"] = current_code
-        else: owner_states[user_id]["code"] = current_code
+        owner_states[user_id]["code"] = current_code
     elif action == "delete":
         if len(current_code) == 0:
-            await event.answer("شنو امسح بعد عزيزي\nترى ماكو", alert=True)
+            await callback.answer("شنو امسح بعد عزيزي\nترى ماكو", show_alert=True)
             return
         current_code = current_code[:-1]
-        if mode == "auth": authorized_users[user_id]["code"] = current_code
-        else: owner_states[user_id]["code"] = current_code
+        owner_states[user_id]["code"] = current_code
     elif action == "verify":
         if len(current_code) < 4:
-            await event.answer("من المفروض ان الكود من اربعه ارقام عزيزي", alert=True)
+            await callback.answer("من المفروض ان الكود من اربعه ارقام عزيزي", show_alert=True)
             return
         if mode == "auth":
             if current_code == default_code:
-                if bot_owner is None: bot_owner = user_id
-                authorized_users[user_id]["verified"] = True
-                await event.edit(MESSAGES["auth_success"])
-                await send_slow_message(event, MESSAGES["start"], reply_to=event.reply_to_msg_id)
+                if bot_owner is None:
+                    bot_owner = user_id
+                    set_config("bot_owner", bot_owner)
+                save_user_auth(user_id, True)
+                owner_states.pop(user_id, None)
+                await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], edit_message_id=callback.message.message_id)
+                reply_to_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
+                await send_slow_message(callback.message.chat.id, MESSAGES["start"], reply_to_message_id=reply_to_id)
                 return
             else:
-                authorized_users[user_id]["code"] = ""
-                await event.edit(MESSAGES["auth_wrong"])
+                owner_states[user_id]["code"] = ""
+                await send_slow_message(callback.message.chat.id, MESSAGES["auth_wrong"], edit_message_id=callback.message.message_id)
                 await asyncio.sleep(2)
                 code_text, keyboard = get_keypad("0000", "auth")
-                await event.edit(code_text, buttons=keyboard)
+                await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
                 return
         elif mode == "change":
             default_code = current_code
+            set_config("default_code", default_code)
+            reset_all_users_except_owner()
+            if bot_owner is not None:
+                save_user_auth(bot_owner, True)
             owner_states.pop(user_id, None)
-            await event.edit("تم تعيين الكود الافتراضي")
+            await send_slow_message(callback.message.chat.id, "تم تعيين الكود الافتراضي", edit_message_id=callback.message.message_id)
             return
             
     display = current_code.ljust(4, '0')
     code_text, keyboard = get_keypad(display, mode)
-    await event.edit(code_text, buttons=keyboard)
+    await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
+    await callback.answer()
 
-@client.on(events.NewMessage())
-async def main_logic(event):
+@dp.message()
+async def main_logic(message: Message):
     global bot_owner, bot_online
-    user_id = event.sender_id
-    if event.text and event.text.startswith('/start'):
+    user_id = message.from_user.id
+    
+    if not message.text:
         return
 
-    is_url = event.text.startswith(("http://", "https://")) if event.text else False
+    is_url = message.text.startswith(("http://", "https://"))
     
     if bot_owner is not None and user_id == bot_owner:
-        if event.text and user_id in owner_states and owner_states[user_id].get("action") == "transferring":
-            asyncio.create_task(handle_reaction(event, "🍓"))
-            if event.text.isdigit():
-                new_owner = int(event.text)
+        if user_id in owner_states and owner_states[user_id].get("action") == "transferring":
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+            if message.text.isdigit():
+                new_owner = int(message.text)
+                save_user_auth(bot_owner, False)
                 bot_owner = new_owner
+                set_config("bot_owner", bot_owner)
+                save_user_auth(new_owner, True)
                 owner_states.pop(user_id, None)
-                if new_owner not in authorized_users: authorized_users[new_owner] = {}
-                authorized_users[new_owner]["verified"] = True
-                await event.reply("تم تعيين هذا المالك\nبدون مشاكل")
+                await send_slow_message(message.chat.id, "تم تعيين هذا المالك\nبدون مشاكل")
             else:
                 owner_states.pop(user_id, None)
-                await event.reply("دز ايدي المالك مو تمضرط وياي\nهوف داضوج")
+                await send_slow_message(message.chat.id, "دز ايدي المالك مو تمضرط وياي\nهوف داضوج")
             return
         if is_url:
-            asyncio.create_task(handle_reaction(event, "🍌"))
-            await send_slow_message(event, MESSAGES["received"], buttons=get_media_panel(event.text))
-        elif event.text:
-            asyncio.create_task(handle_reaction(event, "🍓"))
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
+            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text))
+        else:
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
         return
         
-    if not bot_online: return
-    if user_id not in authorized_users or not authorized_users[user_id].get("verified", False): return
+    if not bot_online:
+        return
+    auth_data = load_user_auth(user_id)
+    if not auth_data["verified"]:
+        return
     
     if is_url:
-        asyncio.create_task(handle_reaction(event, "🍌"))
-        await send_slow_message(event, MESSAGES["received"], buttons=get_media_panel(event.text))
-    elif event.text:
-        asyncio.create_task(handle_reaction(event, "🍓"))
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
+        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text))
+    else:
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
 
-@client.on(events.CallbackQuery(data=re.compile(b"dl_")))
-async def handle_callback(event):
+@dp.callback_query(F.data.startswith('dl_'))
+async def handle_callback(callback: CallbackQuery):
     global bot_owner, bot_online
-    user_id = event.sender_id
+    user_id = callback.from_user.id
     
+    token_match = callback.data.split("_")
+    if len(token_match) < 3:
+        return
+    token = "_".join(token_match[2:])
+    
+    if token in active_downloads:
+        await callback.answer("اه كسي لتبعصني هواي ترى دافتهم وراح\nانزع بس يكمل طلبك", show_alert=True)
+        return
+        
+    if bot_owner is not None and user_id != bot_owner:
+        auth_data = load_user_auth(user_id)
+        if not bot_online or not auth_data["verified"]:
+            return
+
+    url = url_cache.get(token)
+    if not url:
+        try:
+            await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
+        except:
+            pass
+        target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
+        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=target_reply_id)
+        return
+
+    active_downloads.add(token)
     try:
-        await event.edit(buttons=None)
+        await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
     except:
         pass
         
-    if bot_owner is not None and user_id != bot_owner:
-        if not bot_online or not authorized_users.get(user_id, {}).get("verified", False):
-            return
-            
-    parts = event.data.decode().split("_")
-    mode = parts[1]
-    token = "_".join(parts[2:])
+    mode = token_match[1]
+    target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
     
-    target_reply_id = event.reply_to_msg_id if event.reply_to_msg_id else event.message_id
-    
-    url = url_cache.get(token)
-    if not url:
-        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
-        return
+    try:
+        loop = asyncio.get_running_loop()
+        check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
         
-    loop = asyncio.get_event_loop()
-    check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
-    
-    if check_result == "is_video_not_img":
-        await send_slow_message(event, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to=target_reply_id)
-        return
-    elif check_result == "not_album":
-        await send_slow_message(event, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to=target_reply_id)
-        return
-    elif check_result == "error":
-        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
-        return
+        if check_result == "is_video_not_img":
+            await send_slow_message(callback.message.chat.id, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to=message_id)
+            return
+        elif check_result == "not_album":
+            await send_slow_message(callback.message.chat.id, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to=message_id)
+            return
+        elif check_result == "error":
+            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+            return
 
-    status_msg = await event.reply("يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%")
-    asyncio.create_task(handle_bot_self_reaction(status_msg))
-    
-    progress_hook = make_progress_hook(loop, event.chat_id, status_msg.id)
-    
-    result, file_msg_id = await loop.run_in_executor(
-        executor, process_media, url, user_id, mode, 
-        target_reply_id, event.chat_id, progress_hook
-    )
-    
-    if result == True:
-        try:
-            await client.edit_message(event.chat_id, status_msg.id, "يتم تنفيذ طلبك عزيزي\nانتظر شويه")
-        except:
-            pass
-        if file_msg_id:
-            await send_slow_message(event, MESSAGES["success"])
-    elif isinstance(result, str) and result.startswith("too_large:"):
-        size_mb = result.split(":")[1]
-        await send_slow_message(
-            event,
-            MESSAGES["too_large"].format(size=f"{size_mb}MB"),
-            reply_to=target_reply_id
+        status_msg = await bot.send_message(chat_id=callback.message.chat.id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%")
+        asyncio.create_task(handle_bot_self_reaction(callback.message.chat.id, status_msg.message_id))
+        
+        progress_hook = make_progress_hook(loop, callback.message.chat.id, status_msg.message_id)
+        
+        result, file_msg_id = await process_media_async(
+            url, user_id, mode, target_reply_id, callback.message.chat.id, progress_hook
         )
-    else:
-        await send_slow_message(event, MESSAGES["error"], reply_to=target_reply_id)
+        
+        if result == True:
+            try:
+                await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=status_msg.message_id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه")
+            except:
+                pass
+            if file_msg_id:
+                await send_slow_message(callback.message.chat.id, MESSAGES["success"])
+        elif isinstance(result, str) and result.startswith("too_large:"):
+            size_mb = result.split(":")[1]
+            await send_slow_message(
+                callback.message.chat.id,
+                MESSAGES["too_large"].format(size=f"{size_mb}MB"),
+                reply_to_message_id=target_reply_id
+            )
+        else:
+            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+            
+    except:
+        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+    finally:
+        url_cache.pop(token, None)
+        active_downloads.discard(token)
+    await callback.answer()
+
+async def main():
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    client.run_until_disconnected()
+    asyncio.run(main())
