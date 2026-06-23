@@ -90,9 +90,7 @@ def reset_all_users_except_owner():
     cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
     conn.commit()
 
-def get_keypad(code="0000", mode="auth"):
-    display_code = " ".join(list(code))
-    
+def get_keypad(mode="auth"):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"),
@@ -116,9 +114,7 @@ def get_keypad(code="0000", mode="auth"):
         ]
     ])
     
-    if mode == "change":
-        return f"عين الكود الافتراضي\n\n{display_code}", keyboard
-    return f"{display_code}", keyboard
+    return "عين الكود الافتراضي : <tg-spoiler>0 0 0 0</tg-spoiler>", keyboard
 
 def get_owner_panel():
     global bot_online
@@ -149,52 +145,13 @@ def get_media_panel(url):
         ]
     ])
 
-async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, edit_message_id=None):
-    chunks = []
-    remaining = text
-    add_words = True
-    
-    while remaining:
-        if add_words:
-            match = re.match(r'^(\s*\S+\s+\S+|\s*\S+)', remaining)
-            if match:
-                chunk = match.group(1)
-                chunks.append(chunk)
-                remaining = remaining[len(chunk):]
-            else:
-                break
-        else:
-            chunk = remaining[:2]
-            chunks.append(chunk)
-            remaining = remaining[2:]
-        add_words = not add_words
-
-    current_text = ""
-    msg_id = edit_message_id
-    
-    for chunk in chunks:
-        current_text += chunk
-        if not current_text.strip():
-            current_text = " "
-        try:
-            if not msg_id:
-                kwargs = {}
-                if reply_to_message_id:
-                    kwargs['reply_to_message_id'] = reply_to_message_id
-                res = await bot.send_message(chat_id=chat_id, text=current_text, **kwargs)
-                msg_id = res.message_id
-            else:
-                await asyncio.sleep(0.1)
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=current_text, reply_markup=buttons)
-        except Exception:
-            pass
-            
-    if buttons and msg_id:
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=current_text if current_text.strip() else " ", reply_markup=buttons)
-        except Exception:
-            pass
-    return msg_id
+async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None):
+    kwargs = {}
+    if reply_to_message_id:
+        kwargs['reply_to_message_id'] = reply_to_message_id
+        
+    res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
+    return res.message_id
 
 async def handle_reaction(chat_id, message_id, emoji: str):
     await asyncio.sleep(3)
@@ -353,7 +310,7 @@ async def cmd_start(message: Message):
     
     auth_data = load_user_auth(user_id)
     if auth_data["verified"]:
-        await send_slow_message(message.chat.id, MESSAGES["start"])
+        await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
         return
         
     if bot_owner is not None and user_id != bot_owner:
@@ -361,14 +318,14 @@ async def cmd_start(message: Message):
             return
             
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
-    owner_states.pop(user_id, None)
-    code_text, keyboard = get_keypad("0000", "auth")
-    await send_slow_message(message.chat.id, code_text, buttons=keyboard)
+    owner_states[user_id] = {"action": "auth", "code": ""}
+    code_text, keyboard = get_keypad("auth")
+    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id)
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
-    await send_slow_message(message.chat.id, " ", buttons=get_owner_panel())
+    await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
 
 @dp.callback_query(F.data.startswith('owner_'))
 async def handle_owner_panel(callback: CallbackQuery):
@@ -379,19 +336,19 @@ async def handle_owner_panel(callback: CallbackQuery):
         
     action = callback.data.split("_")[1]
     if action == "change":
-        owner_states[bot_owner] = {"action": "changing_code", "code": ""}
-        code_text, keyboard = get_keypad("0000", "change")
-        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
+        owner_states[bot_owner] = {"action": "change", "code": ""}
+        code_text, keyboard = get_keypad("change")
+        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id)
     elif action == "transfer":
         owner_states[bot_owner] = {"action": "transferring"}
-        await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", edit_message_id=callback.message.message_id)
+        await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", reply_to_message_id=callback.message.message_id)
     elif action == "toggle":
         bot_online = not bot_online
         set_config("bot_online", str(bot_online))
         if bot_online:
-            await send_slow_message(callback.message.chat.id, "صار يشتغل للكل وتدلل يبعدي\nاوف مولاي", edit_message_id=callback.message.message_id, buttons=get_owner_panel())
+            await send_slow_message(callback.message.chat.id, "صار يشتغل للكل وتدلل يبعدي\nاوف مولاي", reply_to_message_id=callback.message.message_id)
         else:
-            await send_slow_message(callback.message.chat.id, "عطلته عن الكل مولاي وشغال\nبس عندك", edit_message_id=callback.message.message_id, buttons=get_owner_panel())
+            await send_slow_message(callback.message.chat.id, "عطلته عن الكل مولاي وشغال\nبس عندك", reply_to_message_id=callback.message.message_id)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith('key_'))
@@ -406,14 +363,10 @@ async def handle_keypad(callback: CallbackQuery):
         await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
-    if mode == "auth":
-        if user_id not in owner_states:
-            owner_states[user_id] = {"action": "auth", "code": ""}
-        current_code = owner_states[user_id]["code"]
-    else:
-        if user_id not in owner_states:
-            owner_states[user_id] = {"action": "changing_code", "code": ""}
-        current_code = owner_states[user_id]["code"]
+    if user_id not in owner_states:
+        owner_states[user_id] = {"action": mode, "code": ""}
+    
+    current_code = owner_states[user_id].get("code", "")
         
     if action.isdigit():
         if len(current_code) >= 4:
@@ -421,12 +374,16 @@ async def handle_keypad(callback: CallbackQuery):
             return
         current_code += action
         owner_states[user_id]["code"] = current_code
+        await callback.answer()
+        return
     elif action == "delete":
         if len(current_code) == 0:
             await callback.answer("شنو امسح بعد عزيزي\nترى ماكو", show_alert=True)
             return
         current_code = current_code[:-1]
         owner_states[user_id]["code"] = current_code
+        await callback.answer()
+        return
     elif action == "verify":
         if len(current_code) < 4:
             await callback.answer("من المفروض ان الكود من اربعه ارقام عزيزي", show_alert=True)
@@ -438,16 +395,19 @@ async def handle_keypad(callback: CallbackQuery):
                     set_config("bot_owner", bot_owner)
                 save_user_auth(user_id, True)
                 owner_states.pop(user_id, None)
-                await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], edit_message_id=callback.message.message_id)
-                reply_to_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
-                await send_slow_message(callback.message.chat.id, MESSAGES["start"], reply_to_message_id=reply_to_id)
+                
+                try:
+                    await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+                except:
+                    pass
+                    
+                ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
+                await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], reply_to_message_id=ref_id)
+                await send_slow_message(callback.message.chat.id, MESSAGES["start"], reply_to_message_id=ref_id)
                 return
             else:
                 owner_states[user_id]["code"] = ""
-                await send_slow_message(callback.message.chat.id, MESSAGES["auth_wrong"], edit_message_id=callback.message.message_id)
-                await asyncio.sleep(2)
-                code_text, keyboard = get_keypad("0000", "auth")
-                await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
+                await callback.answer(MESSAGES["auth_wrong"], show_alert=True)
                 return
         elif mode == "change":
             default_code = current_code
@@ -456,12 +416,15 @@ async def handle_keypad(callback: CallbackQuery):
             if bot_owner is not None:
                 save_user_auth(bot_owner, True)
             owner_states.pop(user_id, None)
-            await send_slow_message(callback.message.chat.id, "تم تعيين الكود الافتراضي", edit_message_id=callback.message.message_id)
-            return
             
-    display = current_code.ljust(4, '0')
-    code_text, keyboard = get_keypad(display, mode)
-    await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, edit_message_id=callback.message.message_id)
+            try:
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+            except:
+                pass
+                
+            ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
+            await send_slow_message(callback.message.chat.id, "تم تعيين الكود الافتراضي", reply_to_message_id=ref_id)
+            return
     await callback.answer()
 
 @dp.message()
@@ -484,14 +447,14 @@ async def main_logic(message: Message):
                 set_config("bot_owner", bot_owner)
                 save_user_auth(new_owner, True)
                 owner_states.pop(user_id, None)
-                await send_slow_message(message.chat.id, "تم تعيين هذا المالك\nبدون مشاكل")
+                await send_slow_message(message.chat.id, "تم تعيين هذا المالك\nبدون مشاكل", reply_to_message_id=message.message_id)
             else:
                 owner_states.pop(user_id, None)
-                await send_slow_message(message.chat.id, "دز ايدي المالك مو تمضرط وياي\nهوف داضوج")
+                await send_slow_message(message.chat.id, "دز ايدي المالك مو تمضرط وياي\nهوف داضوج", reply_to_message_id=message.message_id)
             return
         if is_url:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
-            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text))
+            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
         else:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
         return
@@ -504,7 +467,7 @@ async def main_logic(message: Message):
     
     if is_url:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
-        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text))
+        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
     else:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
 
@@ -529,65 +492,72 @@ async def handle_callback(callback: CallbackQuery):
 
     url = url_cache.get(token)
     if not url:
-        try:
-            await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
-        except:
-            pass
-        target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
-        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=target_reply_id)
+        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=callback.message.message_id)
         return
 
     active_downloads.add(token)
-    try:
-        await bot.edit_message_reply_markup(chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
-    except:
-        pass
-        
     mode = token_match[1]
-    target_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
+    
+    orig_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
     
     try:
         loop = asyncio.get_running_loop()
         check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
         
         if check_result == "is_video_not_img":
-            await send_slow_message(callback.message.chat.id, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to=message_id)
+            await send_slow_message(callback.message.chat.id, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to_message_id=orig_reply_id)
             return
         elif check_result == "not_album":
-            await send_slow_message(callback.message.chat.id, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to=message_id)
+            await send_slow_message(callback.message.chat.id, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to_message_id=orig_reply_id)
             return
         elif check_result == "error":
-            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
             return
 
-        status_msg = await bot.send_message(chat_id=callback.message.chat.id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%")
-        asyncio.create_task(handle_bot_self_reaction(callback.message.chat.id, status_msg.message_id))
+        status_msg_id = await send_slow_message(chat_id=callback.message.chat.id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%", reply_to_message_id=orig_reply_id)
+        asyncio.create_task(handle_bot_self_reaction(callback.message.chat.id, status_msg_id))
         
-        progress_hook = make_progress_hook(loop, callback.message.chat.id, status_msg.message_id)
+        progress_hook = make_progress_hook(loop, callback.message.chat.id, status_msg_id)
         
         result, file_msg_id = await process_media_async(
-            url, user_id, mode, target_reply_id, callback.message.chat.id, progress_hook
+            url, user_id, mode, orig_reply_id, callback.message.chat.id, progress_hook
         )
         
         if result == True:
             try:
-                await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=status_msg.message_id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه")
+                await bot.edit_message_text(
+                    chat_id=callback.message.chat.id,
+                    message_id=status_msg_id,
+                    text="اه نيكني نفذت طلبك بليز لو اصيح واكول\nهذا يريد يغتصبني لزموه كواد"
+                )
             except:
                 pass
             if file_msg_id:
-                await send_slow_message(callback.message.chat.id, MESSAGES["success"])
+                await send_slow_message(callback.message.chat.id, MESSAGES["success"], reply_to_message_id=file_msg_id)
         elif isinstance(result, str) and result.startswith("too_large:"):
+            try:
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
+            except:
+                pass
             size_mb = result.split(":")[1]
             await send_slow_message(
                 callback.message.chat.id,
                 MESSAGES["too_large"].format(size=f"{size_mb}MB"),
-                reply_to_message_id=target_reply_id
+                reply_to_message_id=orig_reply_id
             )
         else:
-            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+            try:
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
+            except:
+                pass
+            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
             
     except:
-        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to=message_id)
+        try:
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
+        except:
+            pass
+        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
     finally:
         url_cache.pop(token, None)
         active_downloads.discard(token)
