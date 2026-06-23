@@ -419,10 +419,7 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
-    global current_owner_panel_token, bot_owner
-    if message.from_user.id != bot_owner:
-        return
-        
+    global current_owner_panel_token
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
     current_owner_panel_token = secrets.token_hex(8)
     await send_slow_message(message.chat.id, " ", buttons=get_owner_panel(current_owner_panel_token), reply_to_message_id=message.message_id)
