@@ -4,8 +4,7 @@ import asyncio
 import re
 import random
 import hashlib
-import psycopg2
-from psycopg2.extras import DictCursor
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
@@ -31,7 +30,6 @@ MESSAGES = {
 }
 
 SECRET_SALT = "SECURE_RANDOM_SALT_987654321_ALIVE"
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if os.path.exists("downloads"):
     try:
@@ -40,12 +38,9 @@ if os.path.exists("downloads"):
         pass
 os.makedirs("downloads", exist_ok=True)
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
-
-def init_db():
-    conn = get_db_connection()
+with sqlite3.connect("bot_data.db") as conn:
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
@@ -54,36 +49,25 @@ def init_db():
     """)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY,
+        user_id INTEGER PRIMARY KEY,
         verified INTEGER DEFAULT 0,
         msg_count INTEGER DEFAULT 0
     )
     """)
     conn.commit()
-    cursor.close()
-    conn.close()
-
-init_db()
 
 def get_config(key, default=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM config WHERE key = %s", (key,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row[0] if row else default
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else default
 
 def set_config(key, value):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO config (key, value) VALUES (%s, %s)
-    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    """, (key, str(value)))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
 
 bot_owner = get_config("bot_owner")
 if bot_owner:
@@ -106,46 +90,33 @@ def generate_user_url_token(user_id, url):
     return hashlib.md5(raw_str.encode('utf-8')).hexdigest()[:12]
 
 def load_user_auth(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=DictCursor)
-    cursor.execute("SELECT verified, msg_count FROM users WHERE user_id = %s", (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if row:
-        return {"code": "", "verified": bool(row['verified']), "msg_count": row['msg_count']}
-    return {"code": "", "verified": False, "msg_count": 0}
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT verified, msg_count FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return {"code": "", "verified": bool(row[0]), "msg_count": row[1]}
+        return {"code": "", "verified": False, "msg_count": 0}
 
 def save_user_auth(user_id, verified):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    val = 1 if verified else 0
-    cursor.execute("""
-    INSERT INTO users (user_id, verified, msg_count) VALUES (%s, %s, 0)
-    ON CONFLICT (user_id) DO UPDATE SET verified = EXCLUDED.verified
-    """, (user_id, val))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, verified, msg_count) VALUES (?, ?, 0)", (user_id, 1 if verified else 0))
+        cursor.execute("UPDATE users SET verified = ? WHERE user_id = ?", (1 if verified else 0, user_id))
+        conn.commit()
 
 def increment_msg_count(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO users (user_id, verified, msg_count) VALUES (%s, 0, 1)
-    ON CONFLICT (user_id) DO UPDATE SET msg_count = users.msg_count + 1
-    """, (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, verified, msg_count) VALUES (?, 0, 0)", (user_id,))
+        cursor.execute("UPDATE users SET msg_count = msg_count + 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 def reset_all_users_except_owner():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET verified = 0 WHERE user_id != %s", (bot_owner,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
+        conn.commit()
 
 def get_keypad(mode="auth", current_code=""):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
