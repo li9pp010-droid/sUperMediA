@@ -17,7 +17,8 @@ from aiogram.enums import ParseMode, ButtonStyle
 ffmpeg_path = static_ffmpeg.add_paths(weak=True)
 
 MESSAGES = {
-    "start": "اهلين دز رابط الميديا التريدها عزيزي\nاوف يلا",
+    "start_alt1": "اهلين دز رابط الميديا التريدها عزيزي\nاوف يلا",
+    "start_alt2": "مو ناوي تستعملني مثل البوتات\nلو شنو",
     "received": "تم استلام الرابط عزيزي\nشلون تريده",
     "success": "تم تنفيذ طلبك بدون مشاكل\nاوف عزيزي",
     "error": "اكو مشكله فنيه بالبوت\nانتظر شويه",
@@ -68,6 +69,8 @@ bot_online = get_config("bot_online", "True") == "True"
 owner_states = {}
 url_cache = {}
 active_downloads = set()
+user_msg_toggle = {}
+current_owner_panel_token = ""
 executor = ProcessPoolExecutor(max_workers=18)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
@@ -119,7 +122,7 @@ def get_keypad(mode="auth", current_code=""):
     
     return f"عين الكود الافتراضي : <tg-spoiler>\u200e{spaced_display}</tg-spoiler>", keyboard
 
-def get_owner_panel():
+def get_owner_panel(token):
     global bot_online
     if bot_online:
         online_text = "تعطيل الاونلاين"
@@ -130,11 +133,11 @@ def get_owner_panel():
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code", style=ButtonStyle.DANGER),
-            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer", style=ButtonStyle.DANGER)
+            InlineKeyboardButton(text="تغيير الكود", callback_data=f"owner_change_{token}", style=ButtonStyle.DANGER),
+            InlineKeyboardButton(text="نقل ملكية البوت", callback_data=f"owner_transfer_{token}", style=ButtonStyle.DANGER)
         ],
         [
-            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online", style=online_style)
+            InlineKeyboardButton(text=online_text, callback_data=f"owner_toggle_{token}", style=online_style)
         ]
     ])
 
@@ -385,6 +388,15 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
             except:
                 pass
 
+async def respond_to_verified_user(message: Message):
+    user_id = message.from_user.id
+    current_state = user_msg_toggle.get(user_id, False)
+    if not current_state:
+        await send_slow_message(message.chat.id, MESSAGES["start_alt1"], reply_to_message_id=message.message_id)
+    else:
+        await send_slow_message(message.chat.id, MESSAGES["start_alt2"], reply_to_message_id=message.message_id)
+    user_msg_toggle[user_id] = not current_state
+
 @dp.message(F.text == '/start')
 async def cmd_start(message: Message):
     global bot_owner, bot_online
@@ -393,7 +405,7 @@ async def cmd_start(message: Message):
     auth_data = load_user_auth(user_id)
     if auth_data["verified"]:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
+        await respond_to_verified_user(message)
         return
         
     if bot_owner is not None and user_id != bot_owner:
@@ -407,17 +419,29 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
+    global current_owner_panel_token, bot_owner
+    if message.from_user.id != bot_owner:
+        return
+        
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-    await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
+    current_owner_panel_token = secrets.token_hex(8)
+    await send_slow_message(message.chat.id, " ", buttons=get_owner_panel(current_owner_panel_token), reply_to_message_id=message.message_id)
 
 @dp.callback_query(F.data.startswith('owner_'))
 async def handle_owner_panel(callback: CallbackQuery):
-    global bot_online, bot_owner
+    global bot_online, bot_owner, current_owner_panel_token
     if callback.from_user.id != bot_owner:
         await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
-    action = callback.data.split("_")[1]
+    parts = callback.data.split("_")
+    action = parts[1]
+    token = parts[2]
+    
+    if token != current_owner_panel_token:
+        await callback.answer("تم انتهاء مدة استعمال هذه الازرار", show_alert=True)
+        return
+        
     if action == "change":
         owner_states[bot_owner] = {"action": "change", "code": ""}
         code_text, keyboard = get_keypad("change", "")
@@ -432,7 +456,7 @@ async def handle_owner_panel(callback: CallbackQuery):
             await bot.edit_message_reply_markup(
                 chat_id=callback.message.chat.id,
                 message_id=callback.message.message_id,
-                reply_markup=get_owner_panel()
+                reply_markup=get_owner_panel(current_owner_panel_token)
             )
         except:
             pass
@@ -504,7 +528,7 @@ async def handle_keypad(callback: CallbackQuery):
                     
                 ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
                 await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], reply_to_message_id=ref_id)
-                await send_slow_message(callback.message.chat.id, MESSAGES["start"], reply_to_message_id=ref_id)
+                await send_slow_message(callback.message.chat.id, MESSAGES["start_alt1"], reply_to_message_id=ref_id)
                 return
             else:
                 owner_states[user_id]["code"] = ""
@@ -563,6 +587,8 @@ async def main_logic(message: Message):
             await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
         else:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+            if message.text != 'ادت':
+                await respond_to_verified_user(message)
         return
         
     auth_data = load_user_auth(user_id)
@@ -583,6 +609,7 @@ async def main_logic(message: Message):
         await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
     else:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+        await respond_to_verified_user(message)
 
 @dp.callback_query(F.data.startswith('dl_'))
 async def handle_callback(callback: CallbackQuery):
