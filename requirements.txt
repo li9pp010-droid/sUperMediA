@@ -1,6 +1,2 @@
-aiogram
+python-telegram-bot
 yt-dlp
-static-ffmpeg
-aiohttp[speedups]
-aiofiles
-aiodns

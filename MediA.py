@@ -1,65 +1,23 @@
 import os
-import shutil
 import asyncio
-import re
-import random
-import hashlib
+import glob
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
-import static_ffmpeg
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji, InputMediaPhoto, InputMediaVideo, InputMediaDocument
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ButtonStyle
-from aiogram.exceptions import TelegramRetryAfter
+TOKEN = os.getenv("BOT_TOKEN")
+MAX_SIZE_BYTES = 567 * 1024 * 1024
 
-ffmpeg_path = static_ffmpeg.add_paths(weak=True)
-
-MESSAGES = {
-    "start": "اهلين دز رابط الميديا التريدها عزيزي\nاوف يلا",
-    "received": "تم استلام الرابط عزيزي\nشلون تريده",
-    "success": "تم تنفيذ طلبك بدون مشاكل\nاوف عزيزي",
-    "error": "اكو مشكله فنيه بالبوت\nانتظر شويه",
-    "too_large": "الحجم ثقيل جداً لا يمكن إرساله: {size}",
-    "auth_success": "تم التعرف عليك عزيزي\nاوف تفضل",
-    "auth_wrong": "كودك غلط فشل التعرف عليك\nمتطفل ابتعد",
-    "lazy_user": "مو ناوي تستعملني مثل البوتات ترى\nازعل منك واكلهم يلزموك"
-}
-
-SECRET_SALT = "SECURE_RANDOM_SALT_987654321_ALIVE"
-
-if os.path.exists("downloads"):
-    try:
-        shutil.rmtree("downloads")
-    except:
-        pass
-os.makedirs("downloads", exist_ok=True)
+executor = ThreadPoolExecutor(max_workers=20)
 
 with sqlite3.connect("bot_data.db") as conn:
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        verified INTEGER DEFAULT 0,
-        msg_count INTEGER DEFAULT 0
-    )
-    """)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS reaction_state (
-        key TEXT PRIMARY KEY,
-        last_state INTEGER DEFAULT 0
-    )
-    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, verified INTEGER DEFAULT 0, msg_count INTEGER DEFAULT 0)")
     conn.commit()
 
 def get_config(key, default=None):
@@ -82,22 +40,6 @@ default_code = get_config("default_code", "9575")
 bot_online = get_config("bot_online", "True") == "True"
 
 owner_states = {}
-url_cache = {}
-active_downloads = set()
-executor = ThreadPoolExecutor(max_workers=10)
-
-last_auth_panels = {}
-last_owner_panels = {}
-last_media_panels = {}
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-def generate_user_url_token(user_id, url):
-    raw_str = f"{user_id}_{url}_{SECRET_SALT}"
-    return hashlib.md5(raw_str.encode('utf-8')).hexdigest()[:12]
 
 def load_user_auth(user_id):
     with sqlite3.connect("bot_data.db") as conn:
@@ -105,8 +47,8 @@ def load_user_auth(user_id):
         cursor.execute("SELECT verified, msg_count FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         if row:
-            return {"code": "", "verified": bool(row[0]), "msg_count": row[1]}
-        return {"code": "", "verified": False, "msg_count": 0}
+            return {"verified": bool(row[0]), "msg_count": row[1]}
+        return {"verified": False, "msg_count": 0}
 
 def save_user_auth(user_id, verified):
     with sqlite3.connect("bot_data.db") as conn:
@@ -135,445 +77,416 @@ def reset_all_users_except_owner():
         cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
         conn.commit()
 
-def get_next_reaction(reaction_type="bot"):
-    with sqlite3.connect("bot_data.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO reaction_state (key, last_state) VALUES (?, 0)", (reaction_type,))
-        cursor.execute("SELECT last_state FROM reaction_state WHERE key = ?", (reaction_type,))
-        current_state = cursor.fetchone()[0]
-        
-        next_state = 1 - current_state
-        cursor.execute("UPDATE reaction_state SET last_state = ? WHERE key = ?", (next_state, reaction_type))
-        conn.commit()
-        
-        if reaction_type == "bot":
-            return "😭" if current_state == 0 else "🤣"
-        else:
-            return "🍓" if current_state == 0 else "🥰"
-
-async def delete_old_panel(chat_id, user_id, panel_dict):
-    if user_id in panel_dict:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=panel_dict[user_id])
-        except:
-            pass
-        panel_dict.pop(user_id, None)
-
 def get_keypad(mode="auth", current_code=""):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3", style=ButtonStyle.PRIMARY)
+            InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"),
+            InlineKeyboardButton(text="2", callback_data=f"key_{mode}_2"),
+            InlineKeyboardButton(text="3", callback_data=f"key_{mode}_3")
         ],
         [
-            InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6", style=ButtonStyle.PRIMARY)
+            InlineKeyboardButton(text="4", callback_data=f"key_{mode}_4"),
+            InlineKeyboardButton(text="5", callback_data=f"key_{mode}_5"),
+            InlineKeyboardButton(text="6", callback_data=f"key_{mode}_6")
         ],
         [
-            InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9", style=ButtonStyle.PRIMARY)
+            InlineKeyboardButton(text="7", callback_data=f"key_{mode}_7"),
+            InlineKeyboardButton(text="8", callback_data=f"key_{mode}_8"),
+            InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9")
         ],
         [
-            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete", style=ButtonStyle.DANGER),
-            InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="✅", callback_data=f"key_{mode}_verify", style=ButtonStyle.SUCCESS)
+            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete"),
+            InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0"),
+            InlineKeyboardButton(text="✅", callback_data=f"key_{mode}_verify")
         ]
     ])
     display = current_code + "0" * (4 - len(current_code))
     spaced_display = " ".join(list(display))
-    return f"عين الكود الافتراضي : <tg-spoiler>\u200e{spaced_display}</tg-spoiler>", keyboard
+    return f"عين الكود الافتراضي : {spaced_display}", keyboard
 
 def get_owner_panel():
     global bot_online
     online_text = "تعطيل الاونلاين" if bot_online else "تفعيل الاونلاين"
-    online_style = ButtonStyle.DANGER if bot_online else ButtonStyle.SUCCESS
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code", style=ButtonStyle.DANGER),
-            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer", style=ButtonStyle.DANGER)
+            InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code"),
+            InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer")
         ],
         [
-            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online", style=online_style)
+            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online")
         ]
     ])
 
-def get_media_panel(user_id, url):
-    token = generate_user_url_token(user_id, url)
-    url_cache[token] = url
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}", style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}", style=ButtonStyle.PRIMARY)
-        ],
-        [
-            InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}", style=ButtonStyle.DANGER),
-            InlineKeyboardButton(text="فيديو / البوم فيديو", callback_data=f"dl_vidalbum_{token}", style=ButtonStyle.DANGER)
-        ]
-    ])
-
-def split_text_pattern(text):
-    tokens = re.split(r'(\s+)', text)
-    chunks = []
-    i = 0
-    pattern_words = True
-    while i < len(tokens):
-        current_chunk = ""
-        if pattern_words:
-            word_count = 0
-            while i < len(tokens) and word_count < 2:
-                token = tokens[i]
-                current_chunk += token
-                if token.strip():
-                    word_count += 1
-                i += 1
-            pattern_words = False
-        else:
-            char_count = 0
-            while i < len(tokens) and char_count < 3:
-                token = tokens[i]
-                if not token.strip():
-                    current_chunk += token
-                    i += 1
-                    continue
-                available = 3 - char_count
-                if len(token) <= available:
-                    current_chunk += token
-                    char_count += len(token)
-                    i += 1
-                else:
-                    current_chunk += token[:available]
-                    tokens[i] = token[available:]
-                    char_count += available
-            pattern_words = True
-        if current_chunk:
-            chunks.append(current_chunk)
-    return chunks
-
-async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, fast=False, panel_type=None, user_id=None):
-    kwargs = {}
-    if reply_to_message_id:
-        kwargs['reply_to_message_id'] = reply_to_message_id
-    if fast or not text.strip():
-        res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
-        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
-        if panel_type and user_id:
-            panel_type[user_id] = res.message_id
-        return res.message_id
-
-    chunks = split_text_pattern(text)
-    if not chunks:
-        res = await bot.send_message(chat_id=chat_id, text=" ", reply_markup=buttons, **kwargs)
-        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
-        if panel_type and user_id:
-            panel_type[user_id] = res.message_id
-        return res.message_id
-
-    current_text = chunks[0]
-    try:
-        msg = await bot.send_message(chat_id=chat_id, text=current_text, **kwargs)
-        asyncio.create_task(handle_bot_self_reaction(chat_id, msg.message_id))
-    except:
-        res = await bot.send_message(chat_id=chat_id, text=text, reply_markup=buttons, **kwargs)
-        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
-        if panel_type and user_id:
-            panel_type[user_id] = res.message_id
-        return res.message_id
-
-    for chunk in chunks[1:]:
-        await asyncio.sleep(0.03)
-        current_text += chunk
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=current_text)
-        except:
-            pass
-    if buttons:
-        try:
-            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg.message_id, reply_markup=buttons)
-        except:
-            pass
-            
-    if panel_type and user_id:
-        panel_type[user_id] = msg.message_id
-    return msg.message_id
-
-async def handle_reaction(chat_id, message_id, is_url: bool):
-    await asyncio.sleep(3)
-    emoji = "🍌" if is_url else get_next_reaction("user")
-    try:
-        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
-    except:
-        pass
-
-async def handle_bot_self_reaction(chat_id, message_id):
-    await asyncio.sleep(3)
-    emoji = get_next_reaction("bot")
-    try:
-        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
-    except:
-        pass
-
-def check_link_info(url, mode):
+def get_media_info(url):
     ydl_opts = {
-        'quiet': True, 
-        'extract_flat': True,
-        'playlist_items': '1-35',
-        'match_filter': lambda info, *, incomplete: 'is_live' not in info or not info['is_live']
+        'extract_flat': False,
+        'skip_download': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return "error"
-            is_playlist = 'entries' in info or info.get('_type') == 'playlist'
-            if mode == 'imgalbum':
-                ext = info.get('ext', '').lower()
-                if not is_playlist and ext and ext not in ['jpg', 'jpeg', 'png', 'webp']:
-                    return "is_video_not_img"
-            if mode in ['imgalbum', 'vidalbum']:
-                if not is_playlist:
-                    return "not_album"
-            return "ok"
-        except:
-            return "error"
+        return ydl.extract_info(url, download=False)
 
-def make_progress_hook(loop, chat_id, message_id):
-    state = {"last_percent": -1, "last_update_time": 0}
-    def hook(d):
-        if d['status'] == 'downloading':
-            total = d.get('total_bytes') or d.get('total_bytes_approx', 0)
-            downloaded = d.get('downloaded_bytes', 0)
-            if total > 0:
-                percent = int((downloaded / total) * 100)
-                current_time = time.time()
-                if percent != state["last_percent"] and percent % 5 == 0 and (current_time - state["last_update_time"] > 2):
-                    state["last_percent"] = percent
-                    state["last_update_time"] = current_time
-                    text = f"يتم تنفيذ طلبك عزيزي\nانتظر شويه {percent}%"
-                    asyncio.run_coroutine_threadsafe(
-                        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text),
-                        loop
-                    )
-    return hook
+def download_media(ydl_opts, url):
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=True)
 
-async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=None):
-    user_dir = os.path.join("downloads", f"{user_id}_{mode}_{int(time.time())}")
-    os.makedirs(user_dir, exist_ok=True)
+async def send_animated_text(update: Update, text: str, reply_to_id: int):
+    lines = text.split('\n')
+    current_display = ""
+    msg = None
     
-    ydl_opts = {
-        'quiet': True,
-        'restrictfilenames': True,
-        'max_filesize': 456 * 1024 * 1024,
-        'playlist_items': '1-35',
-        'yes_playlist': True if 'album' in mode or 'list' in url else False,
-        'ffmpeg_location': shutil.which('ffmpeg') or os.environ.get('FFMPEG_BINARY'),
-        'match_filter': lambda info, *, incomplete: 'is_live' not in info or not info['is_live']
-    }
-    if progress_hook:
-        ydl_opts['progress_hooks'] = [progress_hook]
-    
-    if mode == 'audio':
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'outtmpl': os.path.join(user_dir, '%(uploader)s - %(title)s.%(ext)s'),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3'
-            }],
-        })
-    elif mode == 'imgalbum':
-        ydl_opts.update({
-            'format': 'bestimage/best',
-            'outtmpl': os.path.join(user_dir, '%(uploader)s - %(title)s.%(ext)s'),
-        })
-    else:
-        ydl_opts.update({
-            'format': 'best',
-            'outtmpl': os.path.join(user_dir, '%(uploader)s - %(title)s.%(ext)s'),
-        })
-        
-    loop = asyncio.get_running_loop()
-    try:
-        def download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(url, download=True)
-        
-        await loop.run_in_executor(executor, download)
-        
-        files = []
-        total_folder_size = 0
-        for root, _, filenames in os.walk(user_dir):
-            for filename in filenames:
-                fp = os.path.join(root, filename)
-                files.append(fp)
-                total_folder_size += os.path.getsize(fp)
+    for l_idx, line in enumerate(lines):
+        words = []
+        current_word = ""
+        for char in line:
+            current_word += char
+            if char == ' ' or char == 'ء':
+                words.append(current_word)
+                current_word = ""
+        if current_word:
+            words.append(current_word)
+            
+        paired_words = []
+        temp_pair = ""
+        for w_idx, word in enumerate(words):
+            temp_pair += word
+            if (w_idx + 1) % 2 == 0 or (w_idx + 1) == len(words):
+                paired_words.append(temp_pair)
+                temp_pair = ""
                 
-        if total_folder_size > 456 * 1024 * 1024:
-            size_mb = round(total_folder_size / (1024 * 1024), 1)
-            return f"too_large:{size_mb}", None
+        for p_idx, pair in enumerate(paired_words):
+            if not pair.strip() and p_idx == 0 and len(paired_words) == 1:
+                continue
             
-        if not files:
-            return False, None
-            
-        sorted_files = sorted(files)
-        media_group = []
-        
-        from aiogram.types import FSInputFile
-        
-        for file_path in sorted_files:
-            dir_name = os.path.dirname(file_path)
-            base_name = os.path.basename(file_path)
-            name_part, ext_part = os.path.splitext(base_name)
-            
-            clean_name = re.sub(r'[\\/:*?"<>|#]', ' ', name_part)
-            clean_name = re.sub(r'\s+', ' ', clean_name).strip()
-            clean_name = os.path.basename(clean_name)
-            
-            new_file_path = os.path.join(dir_name, f"{clean_name}{ext_part}")
-            os.rename(file_path, new_file_path)
-            
-            ext = ext_part.lower()
-            input_file = FSInputFile(new_file_path)
-            
-            if mode == 'imgalbum' or ext in ['.jpg', '.jpeg', '.png', '.webp']:
-                media_group.append(InputMediaPhoto(media=input_file))
-            elif mode == 'vidalbum' or ext in ['.mp4', '.mkv', '.mov', '.avi', '.webm']:
-                media_group.append(InputMediaVideo(media=input_file))
+            if current_display == "":
+                current_display = pair
             else:
-                media_group.append(InputMediaDocument(media=input_file))
-
-        if not media_group:
-            return False, None
-
-        chunks = [media_group[i:i + 10] for i in range(0, len(media_group), 10)]
-        last_file_msg_id = None
-        
-        for chunk in chunks:
-            while True:
+                if p_idx == 0 and l_idx > 0:
+                    current_display += "\n" + pair
+                else:
+                    current_display += pair
+            
+            if msg is None:
+                if update.message:
+                    msg = await update.message.reply_text(current_display, reply_to_message_id=reply_to_id)
+                else:
+                    msg = await update.callback_query.message.reply_text(current_display, reply_to_message_id=reply_to_id)
+            else:
+                await asyncio.sleep(0.1)
                 try:
-                    msgs = await bot.send_media_group(chat_id=chat_id, media=chunk, reply_to_message_id=reply_to_msg_id)
-                    if msgs:
-                        last_file_msg_id = msgs[-1].message_id
-                        asyncio.create_task(handle_bot_self_reaction(chat_id, msgs[-1].message_id))
-                    break
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 1)
-                except:
-                    return False, None
-            
-            await asyncio.sleep(2.0)
-            
-        return True, last_file_msg_id
-    except:
-        return False, None
-    finally:
-        if os.path.exists(user_dir):
+                    await msg.edit_text(current_display)
+                except Exception:
+                    pass
+    return msg
+
+async def add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg_id):
+    await asyncio.sleep(3)
+    for msg_id in [user_msg_id, bot_msg_id]:
+        if msg_id:
             try:
-                await loop.run_in_executor(executor, shutil.rmtree, user_dir)
-            except:
+                await context.bot.set_message_reaction(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    reaction=[ReactionTypeEmoji(emoji="🍓")]
+                )
+            except Exception:
                 pass
 
-@dp.message(F.text == 'ادت')
-async def owner_panel_cmd(message: Message):
-    if bot_owner is not None and message.from_user.id != bot_owner:
-        return
-    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_owner, bot_online
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    user_msg_id = update.message.message_id
     
-    await delete_old_panel(message.chat.id, message.from_user.id, last_owner_panels)
-    await send_slow_message(message.chat.id, "اعدادات المالك", buttons=get_owner_panel(), reply_to_message_id=message.message_id, panel_type=last_owner_panels, user_id=message.from_user.id)
+    auth_data = load_user_auth(user_id)
+    
+    if auth_data["verified"]:
+        if bot_owner is not None and user_id != bot_owner and not bot_online:
+            return
+        
+        if auth_data["msg_count"] == 0:
+            bot_msg = await send_animated_text(update, "اهلين دز رابط الميديا التريدها عزيزي\nاوف يلا", user_msg_id)
+            increment_msg_count(user_id)
+        else:
+            bot_msg = await send_animated_text(update, "مو ناوي تستعملني مثل البوتات ترى\nازعل منك واكلهم يلزموك", user_msg_id)
+        
+        if bot_msg:
+            asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+        return
 
-@dp.callback_query(F.data.startswith('owner_'))
-async def handle_owner_panel(callback: CallbackQuery):
+    if bot_owner is not None and user_id != bot_owner and not bot_online:
+        return
+
+    owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
+    code_text, keyboard = get_keypad("auth", "")
+    await update.message.reply_text(code_text, reply_markup=keyboard, reply_to_message_id=user_msg_id)
+
+async def owner_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_owner
+    if bot_owner is not None and update.effective_user.id != bot_owner:
+        return
+    user_msg_id = update.message.message_id
+    await update.message.reply_text("لوحة التحكم للمطور", reply_markup=get_owner_panel(), reply_to_message_id=user_msg_id)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bot_owner, bot_online
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    user_msg_id = update.message.message_id
+    text = update.message.text.strip()
+    
+    if bot_owner is not None and user_id == bot_owner:
+        if user_id in owner_states and owner_states[user_id].get("action") == "transferring" and time.time() <= owner_states[user_id].get("expires_at", 0):
+            if text.isdigit():
+                new_owner = int(text)
+                save_user_auth(bot_owner, False)
+                bot_owner = new_owner
+                set_config("bot_owner", bot_owner)
+                save_user_auth(new_owner, True)
+                owner_states.pop(user_id, None)
+                await send_animated_text(update, "تم تعيين هذا المالك\nبدون مشاكل", user_msg_id)
+            else:
+                owner_states.pop(user_id, None)
+                await send_animated_text(update, "دز ايدي المالك المظبوط", user_msg_id)
+            return
+
+    auth_data = load_user_auth(user_id)
+    if not auth_data["verified"]:
+        if bot_owner is not None and not bot_online:
+            return
+        owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
+        code_text, keyboard = get_keypad("auth", "")
+        await update.message.reply_text(code_text, reply_markup=keyboard, reply_to_message_id=user_msg_id)
+        return
+
+    if bot_owner is not None and user_id != bot_owner and not bot_online:
+        return
+
+    url = text
+    if not (url.startswith("http://") or url.startswith("https://")):
+        if auth_data["msg_count"] == 0:
+            bot_msg = await send_animated_text(update, "اهلين دز رابط الميديا التريدها عزيزي\nاوف يلا", user_msg_id)
+            increment_msg_count(user_id)
+        else:
+            bot_msg = await send_animated_text(update, "مو ناوي تستعملني مثل البوتات ترى\nازعل منك واكلهم يلزموك", user_msg_id)
+            increment_msg_count(user_id)
+        if bot_msg:
+            asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+        return
+
+    reset_msg_count(user_id)
+
+    try:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, get_media_info, url)
+    except Exception:
+        bot_msg = await send_animated_text(update, "الرابط غير مدعوم او الموقع\nغير مدعوم", user_msg_id)
+        await update.message.reply_text("🫧")
+        if bot_msg:
+            asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+        return
+
+    msg3 = await send_animated_text(update, "دانفذ طلبك انتظر مولاي\nبليز", user_msg_id)
+    msg4 = await update.message.reply_text("🫦")
+
+    async def delete_waiting_messages():
+        for m in [msg3, msg4]:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+
+    def create_progress_hook(tg_loop, message_obj):
+        last_percent = ""
+        def hook(d):
+            nonlocal last_percent
+            if d['status'] == 'downloading':
+                percent = d.get('_percent_str', '0.0%')
+                clean_percent = "".join(c for c in percent if c.isdigit() or c=='.' or c=='%').strip()
+                if clean_percent and clean_percent != last_percent:
+                    last_percent = clean_percent
+                    new_text = f"دانفذ طلبك انتظر مولاي\nبليز {clean_percent}"
+                    asyncio.run_coroutine_threadsafe(message_obj.edit_text(new_text), tg_loop)
+        return hook
+
+    if 'entries' in info and not info.get('formats'):
+        ydl_opts = {
+            'format': 'bestvideo+bestaudio/bestvideo/best',
+            'outtmpl': 'downloads/%(channel)s - %(id)s_%(index)s.%(ext)s',
+            'max_filesize': MAX_SIZE_BYTES,
+            'windowsfilenames': True,
+            'trim_file_name': 100,
+            'progress_hooks': [create_progress_hook(loop, msg3)],
+        }
+        try:
+            download_info = await loop.run_in_executor(executor, download_media, ydl_opts, url)
+            await delete_waiting_messages()
+            
+            first_sent_msg_id = None
+            
+            for entry in download_info.get('entries', []):
+                if not entry:
+                    continue
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    file_path = ydl.prepare_filename(entry)
+                
+                base_name = os.path.splitext(file_path)[0]
+                matching_files = [f for f in glob.glob(f"{base_name}.*") if not f.endswith('.part') and not f.endswith('.ytdl')]
+                
+                if matching_files:
+                    real_file_path = matching_files[0]
+                    
+                    if os.path.getsize(real_file_path) > MAX_SIZE_BYTES:
+                        if os.path.exists(real_file_path):
+                            os.remove(real_file_path)
+                        continue
+                    
+                    with open(real_file_path, 'rb') as doc_file:
+                        sent_doc = await update.message.reply_document(document=doc_file, reply_to_message_id=user_msg_id)
+                        if not first_sent_msg_id:
+                            first_sent_msg_id = sent_doc.message_id
+                            
+                    if os.path.exists(real_file_path):
+                        os.remove(real_file_path)
+            
+            if first_sent_msg_id:
+                asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, first_sent_msg_id))
+            return
+        except Exception:
+            bot_msg = await send_animated_text(update, "الرابط غير مدعوم او الموقع\nغير مدعوم", user_msg_id)
+            await update.message.reply_text("🫧")
+            await delete_waiting_messages()
+            if bot_msg:
+                asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+            return
+
+    ydl_opts = {
+        'format': 'bestvideo+bestaudio/bestvideo/best',
+        'outtmpl': 'downloads/%(channel)s - %(id)s.%(ext)s',
+        'max_filesize': MAX_SIZE_BYTES,
+        'windowsfilenames': True,
+        'trim_file_name': 100,
+        'progress_hooks': [create_progress_hook(loop, msg3)],
+    }
+    
+    try:
+        loop = asyncio.get_event_loop()
+        download_info = await loop.run_in_executor(executor, download_media, ydl_opts, url)
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            filename = ydl.prepare_filename(download_info)
+            
+        base_name = os.path.splitext(filename)[0]
+        matching_files = [f for f in glob.glob(f"{base_name}.*") if not f.endswith('.part') and not f.endswith('.ytdl')]
+
+        if matching_files:
+            real_filename = matching_files[0]
+
+            if os.path.getsize(real_filename) > MAX_SIZE_BYTES:
+                os.remove(real_filename)
+                bot_msg = await send_animated_text(update, "ماكدر اشيل عير اطول من كسي\nالعفو منك مولاي", user_msg_id)
+                await update.message.reply_text("🧸")
+                await delete_waiting_messages()
+                if bot_msg:
+                    asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+                return
+            
+            with open(real_filename, 'rb') as document:
+                sent_msg = await update.message.reply_document(document=document, reply_to_message_id=user_msg_id)
+                asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, sent_msg.message_id))
+            
+            os.remove(real_filename)
+            await delete_waiting_messages()
+            
+    except yt_dlp.utils.MaxFileSizeReached:
+        bot_msg = await send_animated_text(update, "ماكدر اشيل عير اطول من كسي\nالعفو منك مولاي", user_msg_id)
+        await update.message.reply_text("🧸")
+        await delete_waiting_messages()
+        if bot_msg:
+            asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+    except Exception:
+        bot_msg = await send_animated_text(update, "الرابط غير مدعوم او الموقع\nغير مدعوم", user_msg_id)
+        await update.message.reply_text("🫧")
+        await delete_waiting_messages()
+        if bot_msg:
+            asyncio.create_task(add_strawberry_reactions(context, chat_id, user_msg_id, bot_msg.message_id))
+
+async def handle_owner_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_online, bot_owner
-    if callback.from_user.id != bot_owner:
-        await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if user_id != bot_owner:
+        await query.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
-    action = callback.data.split("_")[1]
+    action = query.data.split("_")[1]
+    await query.answer()
+    
     if action == "change":
-        await delete_old_panel(callback.message.chat.id, callback.from_user.id, last_owner_panels)
-        await delete_old_panel(callback.message.chat.id, callback.from_user.id, last_auth_panels)
-        
         owner_states[bot_owner] = {"action": "change", "code": "", "expires_at": time.time() + 300}
         code_text, keyboard = get_keypad("change", "")
-        try:
-            await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-        except:
-            pass
-        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.reply_to_message.message_id if callback.message.reply_to_message else None, fast=True, panel_type=last_auth_panels, user_id=callback.from_user.id)
+        await query.message.edit_text(code_text, reply_markup=keyboard)
     elif action == "transfer":
-        await delete_old_panel(callback.message.chat.id, callback.from_user.id, last_owner_panels)
         owner_states[bot_owner] = {"action": "transferring", "expires_at": time.time() + 300}
-        try:
-            await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-        except:
-            pass
-        await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", reply_to_message_id=callback.message.reply_to_message.message_id if callback.message.reply_to_message else None)
+        await query.message.edit_text("دز ايدي المالك التريد\nتعينه")
     elif action == "toggle":
         bot_online = not bot_online
         set_config("bot_online", str(bot_online))
         try:
-            await bot.edit_message_reply_markup(
-                chat_id=callback.message.chat.id,
-                message_id=callback.message.message_id,
-                reply_markup=get_owner_panel()
-            )
-        except:
+            await query.message.edit_reply_markup(reply_markup=get_owner_panel())
+        except Exception:
             pass
         if bot_online:
-            await send_slow_message(callback.message.chat.id, "صار يشتغل للكل وتدلل يبعدي\nاوف مولاي", reply_to_message_id=callback.message.reply_to_message.message_id if callback.message.reply_to_message else None)
+            await query.message.reply_text("صار يشتغل للكل وتدلل يبعدي\nاوف مولاي")
         else:
-            await send_slow_message(callback.message.chat.id, "عطلته عن الكل مولاي وشغال\nبس عندك", reply_to_message_id=callback.message.reply_to_message.message_id if callback.message.reply_to_message else None)
-    await callback.answer()
+            await query.message.reply_text("عطلته عن الكل مولاي وشغال\nبس عندك")
 
-@dp.callback_query(F.data.startswith('key_'))
-async def handle_keypad(callback: CallbackQuery):
+async def handle_keypad_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_owner, default_code
-    user_id = callback.from_user.id
-    parts = callback.data.split("_")
+    query = update.callback_query
+    user_id = query.from_user.id
+    parts = query.data.split("_")
     mode = parts[1]
     action = parts[2]
     
     if mode == "change" and user_id != bot_owner:
-        await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
+        await query.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
     if user_id not in owner_states or time.time() > owner_states[user_id].get("expires_at", 0):
         owner_states[user_id] = {"action": mode, "code": "", "expires_at": time.time() + 300}
-    
-    current_code = owner_states[user_id].get("code", "")
         
+    current_code = owner_states[user_id].get("code", "")
+    
     if action.isdigit():
         if len(current_code) >= 4:
-            await callback.answer("الكود من اربعه ارقام", show_alert=True)
+            await query.answer("الكود من اربعه ارقام", show_alert=True)
             return
         current_code += action
         owner_states[user_id]["code"] = current_code
         code_text, keyboard = get_keypad(mode, current_code)
         try:
-            await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
-        except:
+            await query.message.edit_text(code_text, reply_markup=keyboard)
+        except Exception:
             pass
-        await callback.answer()
+        await query.answer()
         return
     elif action == "delete":
         if len(current_code) == 0:
-            await callback.answer("شنو امسح بعد عزيزي\nترى ماكو", show_alert=True)
+            await query.answer("شنو امسح بعد عزيزي\nترى ماكو", show_alert=True)
             return
         current_code = current_code[:-1]
         owner_states[user_id]["code"] = current_code
         code_text, keyboard = get_keypad(mode, current_code)
         try:
-            await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
-        except:
+            await query.message.edit_text(code_text, reply_markup=keyboard)
+        except Exception:
             pass
-        await callback.answer()
+        await query.answer()
         return
     elif action == "verify":
         if len(current_code) < 4:
-            await callback.answer("من المفروض ان الكود من اربعه ارقام عزيزي", show_alert=True)
+            await query.answer("من المفروض ان الكود من اربعه ارقام عزيزي", show_alert=True)
             return
         if mode == "auth":
             if current_code == default_code:
@@ -584,27 +497,21 @@ async def handle_keypad(callback: CallbackQuery):
                 owner_states.pop(user_id, None)
                 
                 try:
-                    await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-                except:
+                    await query.message.delete()
+                except Exception:
                     pass
-                last_auth_panels.pop(user_id, None)
                     
-                ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
-                
-                await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], reply_to_message_id=ref_id)
-                
                 reset_msg_count(user_id)
-                if callback.message.reply_to_message:
-                    await main_logic(callback.message.reply_to_message)
+                await query.message.reply_text("تم التعرف عليك عزيزي\nاوف تفضل")
                 return
             else:
                 owner_states[user_id]["code"] = ""
                 code_text, keyboard = get_keypad(mode, "")
                 try:
-                    await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
-                except:
+                    await query.message.edit_text(code_text, reply_markup=keyboard)
+                except Exception:
                     pass
-                await callback.answer(MESSAGES["auth_wrong"], show_alert=True)
+                await query.answer("كودك غلط فشل التعرف عليك\nمتطفل ابتعد", show_alert=True)
                 return
         elif mode == "change":
             if user_id != bot_owner:
@@ -617,168 +524,30 @@ async def handle_keypad(callback: CallbackQuery):
             owner_states.pop(user_id, None)
             
             try:
-                await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
-            except:
+                await query.message.delete()
+            except Exception:
                 pass
-            last_auth_panels.pop(user_id, None)
-                
-            ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
-            await send_slow_message(callback.message.chat.id, "تم تعيين الكود الافتراضي", reply_to_message_id=ref_id)
+            await query.message.reply_text("تم تعيين الكود الافتراضي")
             return
-    await callback.answer()
+    await query.answer()
 
-@dp.message()
-async def main_logic(message: Message):
-    global bot_owner, bot_online
-    user_id = message.from_user.id
+def main():
+    if not os.path.exists('downloads'):
+        os.makedirs('downloads')
+        
+    if not TOKEN:
+        return
+        
+    app = Application.builder().token(TOKEN).build()
     
-    if not message.text:
-        return
-
-    is_url = message.text.startswith(("http://", "https://"))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("edit", owner_panel_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Caption("ادت"), owner_panel_cmd))
+    app.add_handler(CallbackQueryHandler(handle_owner_callbacks, pattern="^owner_"))
+    app.add_handler(CallbackQueryHandler(handle_keypad_callbacks, pattern="^key_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    if bot_owner is not None and user_id == bot_owner:
-        if user_id in owner_states and owner_states[user_id].get("action") == "transferring" and time.time() <= owner_states[user_id].get("expires_at", 0):
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-            if message.text.isdigit():
-                new_owner = int(message.text)
-                save_user_auth(bot_owner, False)
-                bot_owner = new_owner
-                set_config("bot_owner", bot_owner)
-                save_user_auth(new_owner, True)
-                owner_states.pop(user_id, None)
-                await send_slow_message(message.chat.id, "تم تعيين هذا المالك\nبدون مشاكل", reply_to_message_id=message.message_id)
-            else:
-                owner_states.pop(user_id, None)
-                await send_slow_message(message.chat.id, "دز ايدي المالك المظبوط", reply_to_message_id=message.message_id)
-            return
-        if is_url:
-            reset_msg_count(user_id)
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-            await delete_old_panel(message.chat.id, user_id, last_media_panels)
-            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id, panel_type=last_media_panels, user_id=user_id)
-        else:
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        return
-        
-    auth_data = load_user_auth(user_id)
-        
-    if not auth_data["verified"]:
-        if bot_owner is not None and not bot_online:
-            return
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        
-        await delete_old_panel(message.chat.id, user_id, last_auth_panels)
-        
-        owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
-        code_text, keyboard = get_keypad("auth", "")
-        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True, panel_type=last_auth_panels, user_id=user_id)
-        return
+    app.run_polling()
 
-    if not bot_online:
-        return
-    
-    if is_url:
-        reset_msg_count(user_id)
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-        await delete_old_panel(message.chat.id, user_id, last_media_panels)
-        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id, panel_type=last_media_panels, user_id=user_id)
-    else:
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        
-        # بعد التحقق: إرسال الرسائل العشوائية المرتبة للمستخدم الموثق مباشرة وبشكل متكرر
-        if auth_data["msg_count"] == 0:
-            await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
-            increment_msg_count(user_id)
-        else:
-            await send_slow_message(message.chat.id, MESSAGES["lazy_user"], reply_to_message_id=message.message_id)
-            increment_msg_count(user_id)
-
-@dp.callback_query(F.data.startswith('dl_'))
-async def handle_callback(callback: CallbackQuery):
-    global bot_owner, bot_online
-    user_id = callback.from_user.id
-    
-    token_match = callback.data.split("_")
-    if len(token_match) < 3:
-        return
-    token = "_".join(token_match[2:])
-    
-    if token in active_downloads:
-        await callback.answer("انتظر ثواني جاري العمل على طلبك الحالي...", show_alert=True)
-        return
-        
-    if bot_owner is not None and user_id != bot_owner:
-        auth_data = load_user_auth(user_id)
-        if not bot_online or not auth_data["verified"]:
-            return
-
-    url = url_cache.get(token)
-    if not url:
-        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=callback.message.message_id)
-        return
-
-    active_downloads.add(token)
-    mode = token_match[1]
-    orig_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
-    status_msg_id = None
-    loop = asyncio.get_running_loop()
-    
-    try:
-        check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
-        
-        if check_result == "is_video_not_img":
-            await send_slow_message(callback.message.chat.id, "هذا الرابط عبارة عن فيديو\nمو صورة", reply_to_message_id=orig_reply_id)
-            return
-        elif check_result == "not_album":
-            await send_slow_message(callback.message.chat.id, "هذا الرابط مو البوم عزيزي\nميديا فردية", reply_to_message_id=orig_reply_id)
-            return
-        elif check_result == "error":
-            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
-            return
-
-        status_msg_id = await send_slow_message(chat_id=callback.message.chat.id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%", reply_to_message_id=orig_reply_id)
-        progress_hook = make_progress_hook(loop, callback.message.chat.id, status_msg_id)
-        
-        result, file_msg_id = await process_media_async(
-            url, user_id, mode, orig_reply_id, callback.message.chat.id, progress_hook
-        )
-        
-        if result == True:
-            try:
-                await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=status_msg_id, text="تم تحميل الملفات بنجاح!")
-            except:
-                pass
-            if file_msg_id:
-                await send_slow_message(callback.message.chat.id, MESSAGES["success"], reply_to_message_id=file_msg_id)
-        elif isinstance(result, str) and result.startswith("too_large:"):
-            try:
-                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
-            except:
-                pass
-            size_mb = result.split(":")[1]
-            await send_slow_message(callback.message.chat.id, MESSAGES["too_large"].format(size=f"{size_mb}MB"), reply_to_message_id=orig_reply_id)
-        else:
-            try:
-                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
-            except:
-                pass
-            await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
-            
-    except Exception as e:
-        if status_msg_id:
-            try:
-                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
-            except:
-                pass
-        await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
-    finally:
-        active_downloads.discard(token)
-        url_cache.pop(token, None)
-        await callback.answer()
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    main()
