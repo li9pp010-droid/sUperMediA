@@ -117,7 +117,7 @@ def get_keypad(mode="auth", current_code=""):
     display = current_code + "0" * (4 - len(current_code))
     spaced_display = " ".join(list(display))
     
-    return f"عين الكود الافتراضي : <tg-spoiler>{spaced_display}</tg-spoiler>", keyboard
+    return f"عين الكود الافتراضي : <tg-spoiler>\u200e{spaced_display}</tg-spoiler>", keyboard
 
 def get_owner_panel():
     global bot_online
@@ -198,18 +198,22 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
         
     if fast or not text.strip():
         res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
+        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
         return res.message_id
 
     chunks = split_text_pattern(text)
     if not chunks:
         res = await bot.send_message(chat_id=chat_id, text=" ", reply_markup=buttons, **kwargs)
+        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
         return res.message_id
 
     current_text = chunks[0]
     try:
         msg = await bot.send_message(chat_id=chat_id, text=current_text, **kwargs)
+        asyncio.create_task(handle_bot_self_reaction(chat_id, msg.message_id))
     except:
         res = await bot.send_message(chat_id=chat_id, text=text, reply_markup=buttons, **kwargs)
+        asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
         return res.message_id
 
     for chunk in chunks[1:]:
@@ -228,8 +232,9 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
 
     return msg.message_id
 
-async def handle_reaction(chat_id, message_id, emoji: str):
+async def handle_reaction(chat_id, message_id, is_url: bool):
     await asyncio.sleep(3)
+    emoji = "🍌" if is_url else random.choice(["🍓", "🥰"])
     try:
         await bot.set_message_reaction(
             chat_id=chat_id,
@@ -240,7 +245,8 @@ async def handle_reaction(chat_id, message_id, emoji: str):
         pass
 
 async def handle_bot_self_reaction(chat_id, message_id):
-    emoji = random.choice(["🤣", "😭"])
+    await asyncio.sleep(3)
+    emoji = random.choice(["😭", "🤣"])
     try:
         await bot.set_message_reaction(
             chat_id=chat_id,
@@ -366,6 +372,7 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
             from aiogram.types import FSInputFile
             input_file = FSInputFile(new_file_path)
             doc_msg = await bot.send_document(chat_id=chat_id, document=input_file, reply_to_message_id=reply_to_msg_id)
+            asyncio.create_task(handle_bot_self_reaction(chat_id, doc_msg.message_id))
             last_file_msg_id = doc_msg.message_id
             
         return True, last_file_msg_id
@@ -385,6 +392,7 @@ async def cmd_start(message: Message):
     
     auth_data = load_user_auth(user_id)
     if auth_data["verified"]:
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
         return
         
@@ -392,14 +400,14 @@ async def cmd_start(message: Message):
         if not bot_online:
             return
             
-    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
     owner_states[user_id] = {"action": "auth", "code": ""}
     code_text, keyboard = get_keypad("auth", "")
     await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
-    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+    asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
     await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
 
 @dp.callback_query(F.data.startswith('owner_'))
@@ -537,7 +545,7 @@ async def main_logic(message: Message):
     
     if bot_owner is not None and user_id == bot_owner:
         if user_id in owner_states and owner_states[user_id].get("action") == "transferring":
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
             if message.text.isdigit():
                 new_owner = int(message.text)
                 save_user_auth(bot_owner, False)
@@ -551,17 +559,17 @@ async def main_logic(message: Message):
                 await send_slow_message(message.chat.id, "دز ايدي المالك مو تمضرط وياي\nهوف داضوج", reply_to_message_id=message.message_id)
             return
         if is_url:
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
             await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
         else:
-            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+            asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         return
         
     auth_data = load_user_auth(user_id)
     if not auth_data["verified"]:
         if bot_owner is not None and not bot_online:
             return
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         owner_states[user_id] = {"action": "auth", "code": ""}
         code_text, keyboard = get_keypad("auth", "")
         await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
@@ -571,10 +579,10 @@ async def main_logic(message: Message):
         return
     
     if is_url:
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍌"))
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
         await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
     else:
-        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
 
 @dp.callback_query(F.data.startswith('dl_'))
 async def handle_callback(callback: CallbackQuery):
@@ -620,7 +628,6 @@ async def handle_callback(callback: CallbackQuery):
             return
 
         status_msg_id = await send_slow_message(chat_id=callback.message.chat.id, text="يتم تنفيذ طلبك عزيزي\nانتظر شويه 0%", reply_to_message_id=orig_reply_id)
-        asyncio.create_task(handle_bot_self_reaction(callback.message.chat.id, status_msg_id))
         
         progress_hook = make_progress_hook(loop, callback.message.chat.id, status_msg_id)
         
