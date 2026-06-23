@@ -90,7 +90,7 @@ def reset_all_users_except_owner():
     cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
     conn.commit()
 
-def get_keypad(mode="auth"):
+def get_keypad(mode="auth", current_code=""):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="1", callback_data=f"key_{mode}_1"),
@@ -108,18 +108,20 @@ def get_keypad(mode="auth"):
             InlineKeyboardButton(text="9", callback_data=f"key_{mode}_9")
         ],
         [
-            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete", style="danger"),
+            InlineKeyboardButton(text="⛔", callback_data=f"key_{mode}_delete"),
             InlineKeyboardButton(text="0", callback_data=f"key_{mode}_0"),
-            InlineKeyboardButton(text="تم", callback_data=f"key_{mode}_verify", style="success")
+            InlineKeyboardButton(text="تم", callback_data=f"key_{mode}_verify")
         ]
     ])
     
-    return "عين الكود الافتراضي : <tg-spoiler>0 0 0 0</tg-spoiler>", keyboard
+    display = current_code + "0" * (4 - len(current_code))
+    spaced_display = " ".join(list(display))
+    
+    return f"عين الكود الافتراضي : <tg-spoiler>{spaced_display}</tg-spoiler>", keyboard
 
 def get_owner_panel():
     global bot_online
     online_text = "تعطيل الاونلاين" if bot_online else "تفعيل الاونلاين"
-    online_style = "success" if bot_online else "danger"
     
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -127,7 +129,7 @@ def get_owner_panel():
             InlineKeyboardButton(text="نقل ملكية البوت", callback_data="owner_transfer")
         ],
         [
-            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online", style=online_style)
+            InlineKeyboardButton(text=online_text, callback_data="owner_toggle_online")
         ]
     ])
 
@@ -136,8 +138,8 @@ def get_media_panel(url):
     url_cache[token] = url
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}", style="success"),
-            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}", style="success")
+            InlineKeyboardButton(text="فيديو", callback_data=f"dl_video_{token}"),
+            InlineKeyboardButton(text="صوت", callback_data=f"dl_audio_{token}")
         ],
         [
             InlineKeyboardButton(text="صورة / البوم صور", callback_data=f"dl_imgalbum_{token}"),
@@ -319,7 +321,7 @@ async def cmd_start(message: Message):
             
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
     owner_states[user_id] = {"action": "auth", "code": ""}
-    code_text, keyboard = get_keypad("auth")
+    code_text, keyboard = get_keypad("auth", "")
     await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id)
 
 @dp.message(F.text == 'ادت')
@@ -337,7 +339,7 @@ async def handle_owner_panel(callback: CallbackQuery):
     action = callback.data.split("_")[1]
     if action == "change":
         owner_states[bot_owner] = {"action": "change", "code": ""}
-        code_text, keyboard = get_keypad("change")
+        code_text, keyboard = get_keypad("change", "")
         await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id)
     elif action == "transfer":
         owner_states[bot_owner] = {"action": "transferring"}
@@ -374,6 +376,11 @@ async def handle_keypad(callback: CallbackQuery):
             return
         current_code += action
         owner_states[user_id]["code"] = current_code
+        code_text, keyboard = get_keypad(mode, current_code)
+        try:
+            await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
+        except:
+            pass
         await callback.answer()
         return
     elif action == "delete":
@@ -382,6 +389,11 @@ async def handle_keypad(callback: CallbackQuery):
             return
         current_code = current_code[:-1]
         owner_states[user_id]["code"] = current_code
+        code_text, keyboard = get_keypad(mode, current_code)
+        try:
+            await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
+        except:
+            pass
         await callback.answer()
         return
     elif action == "verify":
@@ -407,6 +419,11 @@ async def handle_keypad(callback: CallbackQuery):
                 return
             else:
                 owner_states[user_id]["code"] = ""
+                code_text, keyboard = get_keypad(mode, "")
+                try:
+                    await bot.edit_message_text(chat_id=callback.message.chat.id, message_id=callback.message.message_id, text=code_text, reply_markup=keyboard)
+                except:
+                    pass
                 await callback.answer(MESSAGES["auth_wrong"], show_alert=True)
                 return
         elif mode == "change":
@@ -459,10 +476,17 @@ async def main_logic(message: Message):
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
         return
         
-    if not bot_online:
-        return
     auth_data = load_user_auth(user_id)
     if not auth_data["verified"]:
+        if bot_owner is not None and not bot_online:
+            return
+        asyncio.create_task(handle_reaction(message.chat.id, message.message_id, "🍓"))
+        owner_states[user_id] = {"action": "auth", "code": ""}
+        code_text, keyboard = get_keypad("auth", "")
+        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id)
+        return
+
+    if not bot_online:
         return
     
     if is_url:
