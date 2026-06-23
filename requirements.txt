@@ -1,5 +1,7 @@
 aiogram
 yt-dlp
 static-ffmpeg
+psycopg2-binary
 aiohttp[speedups]
 aiofiles
+aiodns

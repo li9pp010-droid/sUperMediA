@@ -3,17 +3,19 @@ import shutil
 import asyncio
 import re
 import random
-import secrets
-import sqlite3
+import hashlib
+import psycopg2
+from psycopg2.extras import DictCursor
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 import static_ffmpeg
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ButtonStyle
+from aiogram.exceptions import TelegramRetryAfter
 
 ffmpeg_path = static_ffmpeg.add_paths(weak=True)
 
@@ -24,8 +26,12 @@ MESSAGES = {
     "error": "اكو مشكله فنيه بالبوت\nانتظر شويه",
     "too_large": "الحجم ثقيل جداً لا يمكن إرساله: {size}",
     "auth_success": "تم التعرف عليك عزيزي\nاوف تفضل",
-    "auth_wrong": "كودك غلط فشل التعرف عليك\nمتطفل ابتعد"
+    "auth_wrong": "كودك غلط فشل التعرف عليك\nمتطفل ابتعد",
+    "lazy_user": "مو ناوي تستعملني مثل البوتات ترى\nازعل منك واكلهم يلزموك"
 }
+
+SECRET_SALT = "SECURE_RANDOM_SALT_987654321_ALIVE"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if os.path.exists("downloads"):
     try:
@@ -34,32 +40,50 @@ if os.path.exists("downloads"):
         pass
 os.makedirs("downloads", exist_ok=True)
 
-db_lock = asyncio.Lock()
-conn = sqlite3.connect("bot_data.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("PRAGMA journal_mode=WAL")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS config (
-    key TEXT PRIMARY KEY,
-    value TEXT
-)
-""")
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    verified INTEGER DEFAULT 0
-)
-""")
-conn.commit()
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        verified INTEGER DEFAULT 0,
+        msg_count INTEGER DEFAULT 0
+    )
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+init_db()
 
 def get_config(key, default=None):
-    cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM config WHERE key = %s", (key,))
     row = cursor.fetchone()
+    cursor.close()
+    conn.close()
     return row[0] if row else default
 
 def set_config(key, value):
-    cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO config (key, value) VALUES (%s, %s)
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """, (key, str(value)))
     conn.commit()
+    cursor.close()
+    conn.close()
 
 bot_owner = get_config("bot_owner")
 if bot_owner:
@@ -70,27 +94,58 @@ bot_online = get_config("bot_online", "True") == "True"
 owner_states = {}
 url_cache = {}
 active_downloads = set()
-executor = ProcessPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=10)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+def generate_user_url_token(user_id, url):
+    raw_str = f"{user_id}_{url}_{SECRET_SALT}"
+    return hashlib.md5(raw_str.encode('utf-8')).hexdigest()[:12]
+
 def load_user_auth(user_id):
-    cursor.execute("SELECT verified FROM users WHERE user_id = ?", (user_id,))
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=DictCursor)
+    cursor.execute("SELECT verified, msg_count FROM users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
+    cursor.close()
+    conn.close()
     if row:
-        return {"code": "", "verified": bool(row[0])}
-    return {"code": "", "verified": False}
+        return {"code": "", "verified": bool(row['verified']), "msg_count": row['msg_count']}
+    return {"code": "", "verified": False, "msg_count": 0}
 
 def save_user_auth(user_id, verified):
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, verified) VALUES (?, ?)", (user_id, 1 if verified else 0))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    val = 1 if verified else 0
+    cursor.execute("""
+    INSERT INTO users (user_id, verified, msg_count) VALUES (%s, %s, 0)
+    ON CONFLICT (user_id) DO UPDATE SET verified = EXCLUDED.verified
+    """, (user_id, val))
     conn.commit()
+    cursor.close()
+    conn.close()
+
+def increment_msg_count(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    INSERT INTO users (user_id, verified, msg_count) VALUES (%s, 0, 1)
+    ON CONFLICT (user_id) DO UPDATE SET msg_count = users.msg_count + 1
+    """, (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 def reset_all_users_except_owner():
-    cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET verified = 0 WHERE user_id != %s", (bot_owner,))
     conn.commit()
+    cursor.close()
+    conn.close()
 
 def get_keypad(mode="auth", current_code=""):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -115,17 +170,14 @@ def get_keypad(mode="auth", current_code=""):
             InlineKeyboardButton(text="✅", callback_data=f"key_{mode}_verify", style=ButtonStyle.SUCCESS)
         ]
     ])
-    
     display = current_code + "0" * (4 - len(current_code))
     spaced_display = " ".join(list(display))
-    
     return f"عين الكود الافتراضي : <tg-spoiler>\u200e{spaced_display}</tg-spoiler>", keyboard
 
 def get_owner_panel():
     global bot_online
     online_text = "تعطيل الاونلاين" if bot_online else "تفعيل الاونلاين"
     online_style = ButtonStyle.DANGER if bot_online else ButtonStyle.SUCCESS
-    
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="تغيير الكود", callback_data="owner_change_code", style=ButtonStyle.DANGER),
@@ -136,8 +188,8 @@ def get_owner_panel():
         ]
     ])
 
-def get_media_panel(url):
-    token = secrets.token_hex(6)
+def get_media_panel(user_id, url):
+    token = generate_user_url_token(user_id, url)
     url_cache[token] = url
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -155,7 +207,6 @@ def split_text_pattern(text):
     chunks = []
     i = 0
     pattern_words = True
-    
     while i < len(tokens):
         current_chunk = ""
         if pattern_words:
@@ -193,7 +244,6 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
     kwargs = {}
     if reply_to_message_id:
         kwargs['reply_to_message_id'] = reply_to_message_id
-        
     if fast or not text.strip():
         res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
         asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
@@ -221,13 +271,11 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
             await bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=current_text)
         except:
             pass
-
     if buttons:
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg.message_id, reply_markup=buttons)
         except:
             pass
-
     return msg.message_id
 
 async def handle_reaction(chat_id, message_id, is_url: bool):
@@ -247,14 +295,18 @@ async def handle_bot_self_reaction(chat_id, message_id):
         pass
 
 def check_link_info(url, mode):
-    ydl_opts = {'quiet': True, 'extract_flat': True}
+    ydl_opts = {
+        'quiet': True, 
+        'extract_flat': True,
+        'playlist_items': '1-35',
+        'match_filter': lambda info, *, incomplete: 'is_live' not in info or not info['is_live']
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
             if not info:
                 return "error"
             is_playlist = 'entries' in info or info.get('_type') == 'playlist'
-            
             if mode == 'imgalbum':
                 ext = info.get('ext', '').lower()
                 if not is_playlist and ext and ext not in ['jpg', 'jpeg', 'png', 'webp']:
@@ -267,20 +319,17 @@ def check_link_info(url, mode):
             return "error"
 
 def make_progress_hook(loop, chat_id, message_id):
-    last_percent = -1
-    last_update_time = 0
-    
+    state = {"last_percent": -1, "last_update_time": 0}
     def hook(d):
-        nonlocal last_percent, last_update_time
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_approx', 0)
             downloaded = d.get('downloaded_bytes', 0)
             if total > 0:
                 percent = int((downloaded / total) * 100)
                 current_time = time.time()
-                if percent != last_percent and percent % 5 == 0 and (current_time - last_update_time > 2):
-                    last_percent = percent
-                    last_update_time = current_time
+                if percent != state["last_percent"] and percent % 5 == 0 and (current_time - state["last_update_time"] > 2):
+                    state["last_percent"] = percent
+                    state["last_update_time"] = current_time
                     text = f"يتم تنفيذ طلبك عزيزي\nانتظر شويه {percent}%"
                     asyncio.run_coroutine_threadsafe(
                         bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text),
@@ -289,16 +338,18 @@ def make_progress_hook(loop, chat_id, message_id):
     return hook
 
 async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, progress_hook=None):
-    user_dir = os.path.join("downloads", f"{user_id}_{secrets.token_hex(4)}")
+    user_dir = os.path.join("downloads", f"{user_id}_{mode}_{int(time.time())}")
     os.makedirs(user_dir, exist_ok=True)
     
     ydl_opts = {
         'quiet': True,
-        'restrictfilenames': False,
+        'restrictfilenames': True,
+        'max_filesize': 456 * 1024 * 1024,
+        'playlist_items': '1-35',
         'yes_playlist': True if 'album' in mode or 'list' in url else False,
-        'ffmpeg_location': shutil.which('ffmpeg') or os.environ.get('FFMPEG_BINARY')
+        'ffmpeg_location': shutil.which('ffmpeg') or os.environ.get('FFMPEG_BINARY'),
+        'match_filter': lambda info, *, incomplete: 'is_live' not in info or not info['is_live']
     }
-    
     if progress_hook:
         ydl_opts['progress_hooks'] = [progress_hook]
     
@@ -331,15 +382,24 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
         await loop.run_in_executor(executor, download)
         
         files = []
+        total_folder_size = 0
         for root, _, filenames in os.walk(user_dir):
             for filename in filenames:
-                files.append(os.path.join(root, filename))
+                fp = os.path.join(root, filename)
+                files.append(fp)
+                total_folder_size += os.path.getsize(fp)
                 
+        if total_folder_size > 456 * 1024 * 1024:
+            size_mb = round(total_folder_size / (1024 * 1024), 1)
+            return f"too_large:{size_mb}", None
+            
         if not files:
             return False, None
             
-        last_file_msg_id = None
         sorted_files = sorted(files)
+        media_group = []
+        
+        from aiogram.types import FSInputFile
         
         for file_path in sorted_files:
             dir_name = os.path.dirname(file_path)
@@ -348,20 +408,41 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
             
             clean_name = re.sub(r'[\\/:*?"<>|#]', ' ', name_part)
             clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+            clean_name = os.path.basename(clean_name)
             
             new_file_path = os.path.join(dir_name, f"{clean_name}{ext_part}")
             os.rename(file_path, new_file_path)
             
-            filesize = os.path.getsize(new_file_path)
-            if filesize > 456 * 1024 * 1024:
-                size_mb = round(filesize / (1024 * 1024), 1)
-                return f"too_large:{size_mb}", None
-                
-            from aiogram.types import FSInputFile
+            ext = ext_part.lower()
             input_file = FSInputFile(new_file_path)
-            doc_msg = await bot.send_document(chat_id=chat_id, document=input_file, reply_to_message_id=reply_to_msg_id)
-            asyncio.create_task(handle_bot_self_reaction(chat_id, doc_msg.message_id))
-            last_file_msg_id = doc_msg.message_id
+            
+            if mode == 'imgalbum' or ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                media_group.append(InputMediaPhoto(media=input_file))
+            elif mode == 'vidalbum' or ext in ['.mp4', '.mkv', '.mov', '.avi', '.webm']:
+                media_group.append(InputMediaVideo(media=input_file))
+            else:
+                media_group.append(InputMediaDocument(media=input_file))
+
+        if not media_group:
+            return False, None
+
+        chunks = [media_group[i:i + 10] for i in range(0, len(media_group), 10)]
+        last_file_msg_id = None
+        
+        for chunk in chunks:
+            while True:
+                try:
+                    msgs = await bot.send_media_group(chat_id=chat_id, media=chunk, reply_to_message_id=reply_to_msg_id)
+                    if msgs:
+                        last_file_msg_id = msgs[-1].message_id
+                        asyncio.create_task(handle_bot_self_reaction(chat_id, msgs[-1].message_id))
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except:
+                    return False, None
+            
+            await asyncio.sleep(2.0)
             
         return True, last_file_msg_id
     except:
@@ -369,7 +450,7 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
     finally:
         if os.path.exists(user_dir):
             try:
-                shutil.rmtree(user_dir)
+                await loop.run_in_executor(executor, shutil.rmtree, user_dir)
             except:
                 pass
 
@@ -377,13 +458,17 @@ async def process_media_async(url, user_id, mode, reply_to_msg_id, chat_id, prog
 async def cmd_start(message: Message):
     global bot_owner, bot_online
     user_id = message.from_user.id
-    
-    async with db_lock:
-        auth_data = load_user_auth(user_id)
+    auth_data = load_user_auth(user_id)
         
     if auth_data["verified"]:
+        if bot_owner is not None and user_id != bot_owner and not bot_online:
+            return
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
+        if auth_data["msg_count"] == 0:
+            await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
+            increment_msg_count(user_id)
+        else:
+            await send_slow_message(message.chat.id, MESSAGES["lazy_user"], reply_to_message_id=message.message_id)
         return
         
     if bot_owner is not None and user_id != bot_owner:
@@ -391,24 +476,16 @@ async def cmd_start(message: Message):
             return
             
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-    
-    if user_id in owner_states and "last_panel_id" in owner_states[user_id]:
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=owner_states[user_id]["last_panel_id"])
-        except:
-            pass
-
-    owner_states[user_id] = {"action": "auth", "code": ""}
+    owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
     code_text, keyboard = get_keypad("auth", "")
-    panel_id = await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
-    owner_states[user_id]["last_panel_id"] = panel_id
+    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
     if bot_owner is not None and message.from_user.id != bot_owner:
         return
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-    await send_slow_message(message.chat.id, "إعدادات المالك", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
+    await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
 
 @dp.callback_query(F.data.startswith('owner_'))
 async def handle_owner_panel(callback: CallbackQuery):
@@ -419,23 +496,23 @@ async def handle_owner_panel(callback: CallbackQuery):
         
     action = callback.data.split("_")[1]
     if action == "change":
-        if bot_owner in owner_states and "last_panel_id" in owner_states[bot_owner]:
-            try:
-                await bot.delete_message(chat_id=callback.message.chat.id, message_id=owner_states[bot_owner]["last_panel_id"])
-            except:
-                pass
-                
-        owner_states[bot_owner] = {"action": "change", "code": ""}
+        owner_states[bot_owner] = {"action": "change", "code": "", "expires_at": time.time() + 300}
         code_text, keyboard = get_keypad("change", "")
-        panel_id = await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id, fast=True)
-        owner_states[bot_owner]["last_panel_id"] = panel_id
+        try:
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+        except:
+            pass
+        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id, fast=True)
     elif action == "transfer":
-        owner_states[bot_owner] = {"action": "transferring"}
+        owner_states[bot_owner] = {"action": "transferring", "expires_at": time.time() + 300}
+        try:
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+        except:
+            pass
         await send_slow_message(callback.message.chat.id, "دز ايدي المالك التريد\nتعينه", reply_to_message_id=callback.message.message_id)
     elif action == "toggle":
         bot_online = not bot_online
-        async with db_lock:
-            set_config("bot_online", str(bot_online))
+        set_config("bot_online", str(bot_online))
         try:
             await bot.edit_message_reply_markup(
                 chat_id=callback.message.chat.id,
@@ -462,8 +539,8 @@ async def handle_keypad(callback: CallbackQuery):
         await callback.answer("لن تستطيع تغيير شيء هنا لانها\nللمطور فقط", show_alert=True)
         return
         
-    if user_id not in owner_states:
-        owner_states[user_id] = {"action": mode, "code": "", "last_panel_id": callback.message.message_id}
+    if user_id not in owner_states or time.time() > owner_states[user_id].get("expires_at", 0):
+        owner_states[user_id] = {"action": mode, "code": "", "expires_at": time.time() + 300}
     
     current_code = owner_states[user_id].get("code", "")
         
@@ -499,11 +576,10 @@ async def handle_keypad(callback: CallbackQuery):
             return
         if mode == "auth":
             if current_code == default_code:
-                async with db_lock:
-                    if bot_owner is None:
-                        bot_owner = user_id
-                        set_config("bot_owner", bot_owner)
-                    save_user_auth(user_id, True)
+                if bot_owner is None:
+                    bot_owner = user_id
+                    set_config("bot_owner", bot_owner)
+                save_user_auth(user_id, True)
                 owner_states.pop(user_id, None)
                 
                 try:
@@ -525,12 +601,13 @@ async def handle_keypad(callback: CallbackQuery):
                 await callback.answer(MESSAGES["auth_wrong"], show_alert=True)
                 return
         elif mode == "change":
+            if user_id != bot_owner:
+                return
             default_code = current_code
-            async with db_lock:
-                set_config("default_code", default_code)
-                reset_all_users_except_owner()
-                if bot_owner is not None:
-                    save_user_auth(bot_owner, True)
+            set_config("default_code", default_code)
+            reset_all_users_except_owner()
+            if bot_owner is not None:
+                save_user_auth(bot_owner, True)
             owner_states.pop(user_id, None)
             
             try:
@@ -554,15 +631,14 @@ async def main_logic(message: Message):
     is_url = message.text.startswith(("http://", "https://"))
     
     if bot_owner is not None and user_id == bot_owner:
-        if user_id in owner_states and owner_states[user_id].get("action") == "transferring":
+        if user_id in owner_states and owner_states[user_id].get("action") == "transferring" and time.time() <= owner_states[user_id].get("expires_at", 0):
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
             if message.text.isdigit():
                 new_owner = int(message.text)
-                async with db_lock:
-                    save_user_auth(bot_owner, False)
-                    bot_owner = new_owner
-                    set_config("bot_owner", bot_owner)
-                    save_user_auth(new_owner, True)
+                save_user_auth(bot_owner, False)
+                bot_owner = new_owner
+                set_config("bot_owner", bot_owner)
+                save_user_auth(new_owner, True)
                 owner_states.pop(user_id, None)
                 await send_slow_message(message.chat.id, "تم تعيين هذا المالك\nبدون مشاكل", reply_to_message_id=message.message_id)
             else:
@@ -571,29 +647,20 @@ async def main_logic(message: Message):
             return
         if is_url:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
+            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id)
         else:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         return
         
-    async with db_lock:
-        auth_data = load_user_auth(user_id)
+    auth_data = load_user_auth(user_id)
         
     if not auth_data["verified"]:
         if bot_owner is not None and not bot_online:
             return
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-        
-        if user_id in owner_states and "last_panel_id" in owner_states[user_id]:
-            try:
-                await bot.delete_message(chat_id=message.chat.id, message_id=owner_states[user_id]["last_panel_id"])
-            except:
-                pass
-
-        owner_states[user_id] = {"action": "auth", "code": ""}
+        owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
         code_text, keyboard = get_keypad("auth", "")
-        panel_id = await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
-        owner_states[user_id]["last_panel_id"] = panel_id
+        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
         return
 
     if not bot_online:
@@ -601,9 +668,14 @@ async def main_logic(message: Message):
     
     if is_url:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(message.text), reply_to_message_id=message.message_id)
+        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id)
     else:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+        if auth_data["msg_count"] == 0:
+            await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
+        else:
+            await send_slow_message(message.chat.id, MESSAGES["lazy_user"], reply_to_message_id=message.message_id)
+        increment_msg_count(user_id)
 
 @dp.callback_query(F.data.startswith('dl_'))
 async def handle_callback(callback: CallbackQuery):
@@ -620,8 +692,7 @@ async def handle_callback(callback: CallbackQuery):
         return
         
     if bot_owner is not None and user_id != bot_owner:
-        async with db_lock:
-            auth_data = load_user_auth(user_id)
+        auth_data = load_user_auth(user_id)
         if not bot_online or not auth_data["verified"]:
             return
 
@@ -633,9 +704,10 @@ async def handle_callback(callback: CallbackQuery):
     active_downloads.add(token)
     mode = token_match[1]
     orig_reply_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else callback.message.message_id
+    status_msg_id = None
+    loop = asyncio.get_running_loop()
     
     try:
-        loop = asyncio.get_running_loop()
         check_result = await loop.run_in_executor(executor, check_link_info, url, mode)
         
         if check_result == "is_video_not_img":
@@ -676,16 +748,17 @@ async def handle_callback(callback: CallbackQuery):
                 pass
             await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
             
-    except:
-        try:
-            await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
-        except:
-            pass
+    except Exception as e:
+        if status_msg_id:
+            try:
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=status_msg_id)
+            except:
+                pass
         await send_slow_message(callback.message.chat.id, MESSAGES["error"], reply_to_message_id=orig_reply_id)
     finally:
-        url_cache.pop(token, None)
         active_downloads.discard(token)
-    await callback.answer()
+        url_cache.pop(token, None)
+        await callback.answer()
 
 async def main():
     await dp.start_polling(bot)
