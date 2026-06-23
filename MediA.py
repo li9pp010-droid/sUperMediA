@@ -54,6 +54,13 @@ with sqlite3.connect("bot_data.db") as conn:
         msg_count INTEGER DEFAULT 0
     )
     """)
+    # جدول لإدارة التفاعلات المتسلسلة بدون عشوائية
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS reaction_state (
+        key TEXT PRIMARY KEY,
+        last_state INTEGER DEFAULT 0
+    )
+    """)
     conn.commit()
 
 def get_config(key, default=None):
@@ -79,6 +86,9 @@ owner_states = {}
 url_cache = {}
 active_downloads = set()
 executor = ThreadPoolExecutor(max_workers=10)
+
+# قاموس لتخزين الـ message_id لآخر لوحة نشطة لكل مستخدم لحذفها بالكامل (Delete حقيقي)
+last_panel_messages = {}
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token_here")
 
@@ -112,11 +122,43 @@ def increment_msg_count(user_id):
         cursor.execute("UPDATE users SET msg_count = msg_count + 1 WHERE user_id = ?", (user_id,))
         conn.commit()
 
+def reset_msg_count(user_id):
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, verified, msg_count) VALUES (?, 0, 0)", (user_id,))
+        cursor.execute("UPDATE users SET msg_count = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+
 def reset_all_users_except_owner():
     with sqlite3.connect("bot_data.db") as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE users SET verified = 0 WHERE user_id != ?", (bot_owner,))
         conn.commit()
+
+# دالة لجلب التفاعل التالي بالتسلسل بدون استخدام random نهائياً
+def get_next_reaction(reaction_type="bot"):
+    with sqlite3.connect("bot_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO reaction_state (key, last_state) VALUES (?, 0)", (reaction_type,))
+        cursor.execute("SELECT last_state FROM reaction_state WHERE key = ?", (reaction_type,))
+        current_state = cursor.fetchone()[0]
+        
+        next_state = 1 - current_state
+        cursor.execute("UPDATE reaction_state SET last_state = ? WHERE key = ?", (next_state, reaction_type))
+        conn.commit()
+        
+        if reaction_type == "bot":
+            return "😭" if current_state == 0 else "🤣"
+        else: # user non-url
+            return "🍓" if current_state == 0 else "🥰"
+
+async def delete_user_last_panel(chat_id, user_id):
+    if user_id in last_panel_messages:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=last_panel_messages[user_id])
+        except:
+            pass
+        last_panel_messages.pop(user_id, None)
 
 def get_keypad(mode="auth", current_code=""):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -211,19 +253,23 @@ def split_text_pattern(text):
             chunks.append(current_chunk)
     return chunks
 
-async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, fast=False):
+async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=None, fast=False, store_panel_for_user=None):
     kwargs = {}
     if reply_to_message_id:
         kwargs['reply_to_message_id'] = reply_to_message_id
     if fast or not text.strip():
         res = await bot.send_message(chat_id=chat_id, text=text if text.strip() else " ", reply_markup=buttons, **kwargs)
         asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
+        if store_panel_for_user is not None:
+            last_panel_messages[store_panel_for_user] = res.message_id
         return res.message_id
 
     chunks = split_text_pattern(text)
     if not chunks:
         res = await bot.send_message(chat_id=chat_id, text=" ", reply_markup=buttons, **kwargs)
         asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
+        if store_panel_for_user is not None:
+            last_panel_messages[store_panel_for_user] = res.message_id
         return res.message_id
 
     current_text = chunks[0]
@@ -233,6 +279,8 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
     except:
         res = await bot.send_message(chat_id=chat_id, text=text, reply_markup=buttons, **kwargs)
         asyncio.create_task(handle_bot_self_reaction(chat_id, res.message_id))
+        if store_panel_for_user is not None:
+            last_panel_messages[store_panel_for_user] = res.message_id
         return res.message_id
 
     for chunk in chunks[1:]:
@@ -247,11 +295,14 @@ async def send_slow_message(chat_id, text, buttons=None, reply_to_message_id=Non
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg.message_id, reply_markup=buttons)
         except:
             pass
+            
+    if store_panel_for_user is not None:
+        last_panel_messages[store_panel_for_user] = msg.message_id
     return msg.message_id
 
 async def handle_reaction(chat_id, message_id, is_url: bool):
     await asyncio.sleep(3)
-    emoji = "🍌" if is_url else random.choice(["🍓", "🥰"])
+    emoji = "🍌" if is_url else get_next_reaction("user")
     try:
         await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
     except:
@@ -259,7 +310,7 @@ async def handle_reaction(chat_id, message_id, is_url: bool):
 
 async def handle_bot_self_reaction(chat_id, message_id):
     await asyncio.sleep(3)
-    emoji = random.choice(["😭", "🤣"])
+    emoji = get_next_reaction("bot")
     try:
         await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)])
     except:
@@ -435,6 +486,8 @@ async def cmd_start(message: Message):
         if bot_owner is not None and user_id != bot_owner and not bot_online:
             return
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+        
+        # إدارة الرسائل غير الرابط بالتسلسل الثابت والإجباري بعد التحقق
         if auth_data["msg_count"] == 0:
             await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
             increment_msg_count(user_id)
@@ -447,16 +500,24 @@ async def cmd_start(message: Message):
             return
             
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+    
+    # حذف اللوحة السابقة بالكامل قبل إنشاء لوحة إدخال الكود الجديدة (Delete حقيقي)
+    await delete_user_last_panel(message.chat.id, user_id)
+    
     owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
     code_text, keyboard = get_keypad("auth", "")
-    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
+    await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True, store_panel_for_user=user_id)
 
 @dp.message(F.text == 'ادت')
 async def owner_panel_cmd(message: Message):
     if bot_owner is not None and message.from_user.id != bot_owner:
         return
     asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
-    await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id)
+    
+    # حذف لوحة التحكم السابقة بالكامل قبل إنشاء الجديدة (Delete حقيقي)
+    await delete_user_last_panel(message.chat.id, message.from_user.id)
+    
+    await send_slow_message(message.chat.id, "لوحة التحكم للمطور", buttons=get_owner_panel(), reply_to_message_id=message.message_id, store_panel_for_user=message.from_user.id)
 
 @dp.callback_query(F.data.startswith('owner_'))
 async def handle_owner_panel(callback: CallbackQuery):
@@ -467,14 +528,20 @@ async def handle_owner_panel(callback: CallbackQuery):
         
     action = callback.data.split("_")[1]
     if action == "change":
+        # حذف اللوحة القديمة بالكامل قبل الانتقال للوحة الجديدة
+        await delete_user_last_panel(callback.message.chat.id, callback.from_user.id)
+        
         owner_states[bot_owner] = {"action": "change", "code": "", "expires_at": time.time() + 300}
         code_text, keyboard = get_keypad("change", "")
         try:
             await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
         except:
             pass
-        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id, fast=True)
+        await send_slow_message(callback.message.chat.id, code_text, buttons=keyboard, reply_to_message_id=callback.message.message_id, fast=True, store_panel_for_user=callback.from_user.id)
     elif action == "transfer":
+        # حذف اللوحة القديمة بالكامل قبل الانتقال
+        await delete_user_last_panel(callback.message.chat.id, callback.from_user.id)
+        
         owner_states[bot_owner] = {"action": "transferring", "expires_at": time.time() + 300}
         try:
             await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
@@ -553,14 +620,20 @@ async def handle_keypad(callback: CallbackQuery):
                 save_user_auth(user_id, True)
                 owner_states.pop(user_id, None)
                 
+                # حذف لوحة إدخال الكود ورسالة التحقق بالكامل Delete حقيقي فور النجاح
                 try:
                     await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
                 except:
                     pass
+                last_panel_messages.pop(user_id, None)
                     
                 ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
+                
+                # تصفير عدد الرسائل ليدخل في حالة انتظار أول رسالة غير رابط يرسلها
+                reset_msg_count(user_id)
+                
+                # إظهار رسالة النجاح فقط ويبقى البوت صامتاً ينتظر أول رسالة
                 await send_slow_message(callback.message.chat.id, MESSAGES["auth_success"], reply_to_message_id=ref_id)
-                await send_slow_message(callback.message.chat.id, MESSAGES["start"], reply_to_message_id=ref_id)
                 return
             else:
                 owner_states[user_id]["code"] = ""
@@ -585,6 +658,7 @@ async def handle_keypad(callback: CallbackQuery):
                 await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
             except:
                 pass
+            last_panel_messages.pop(user_id, None)
                 
             ref_id = callback.message.reply_to_message.message_id if callback.message.reply_to_message else None
             await send_slow_message(callback.message.chat.id, "تم تعيين الكود الافتراضي", reply_to_message_id=ref_id)
@@ -617,8 +691,13 @@ async def main_logic(message: Message):
                 await send_slow_message(message.chat.id, "دز ايدي المالك المظبوط", reply_to_message_id=message.message_id)
             return
         if is_url:
+            # عند إرسال رابط يتم تصفير الحالة والعودة للوضع الطبيعي
+            reset_msg_count(user_id)
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id)
+            
+            # حذف اللوحة السابقة بالكامل قبل إرسال لوحة الميديا الجديدة
+            await delete_user_last_panel(message.chat.id, user_id)
+            await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id, store_panel_for_user=user_id)
         else:
             asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
         return
@@ -629,24 +708,36 @@ async def main_logic(message: Message):
         if bot_owner is not None and not bot_online:
             return
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+        
+        # حذف اللوحة السابقة بالكامل قبل إنشاء لوحة التحقق الجديدة
+        await delete_user_last_panel(message.chat.id, user_id)
+        
         owner_states[user_id] = {"action": "auth", "code": "", "expires_at": time.time() + 300}
         code_text, keyboard = get_keypad("auth", "")
-        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True)
+        await send_slow_message(message.chat.id, code_text, buttons=keyboard, reply_to_message_id=message.message_id, fast=True, store_panel_for_user=user_id)
         return
 
     if not bot_online:
         return
     
     if is_url:
+        # عند إرسال رابط يتم تصفير الحالة والعودة للوضع الطبيعي
+        reset_msg_count(user_id)
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=True))
-        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id)
+        
+        # حذف اللوحة السابقة بالكامل قبل إنشاء لوحة الميديا الجديدة
+        await delete_user_last_panel(message.chat.id, user_id)
+        await send_slow_message(message.chat.id, MESSAGES["received"], buttons=get_media_panel(user_id, message.text), reply_to_message_id=message.message_id, store_panel_for_user=user_id)
     else:
         asyncio.create_task(handle_reaction(message.chat.id, message.message_id, is_url=False))
+        
+        # ترتيب ثابت وإجباري للرسائل غير الرابط بعد التحقق بناءً على حالته المستقلة مخزنة في قاعدة البيانات
         if auth_data["msg_count"] == 0:
             await send_slow_message(message.chat.id, MESSAGES["start"], reply_to_message_id=message.message_id)
+            increment_msg_count(user_id)
         else:
             await send_slow_message(message.chat.id, MESSAGES["lazy_user"], reply_to_message_id=message.message_id)
-        increment_msg_count(user_id)
+            increment_msg_count(user_id)
 
 @dp.callback_query(F.data.startswith('dl_'))
 async def handle_callback(callback: CallbackQuery):
