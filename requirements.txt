@@ -1,0 +1,6 @@
+aiogram
+yt-dlp
+static-ffmpeg
+aiohttp[speedups]
+aiofiles
+aiodns
