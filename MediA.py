@@ -117,7 +117,10 @@ async def process_queue(user_id, chat_id):
                 percent = int((downloaded / total) * 100)
                 if percent >= last_reported_percent[user_id] + 10 or percent == 100:
                     last_reported_percent[user_id] = percent
-                    text_update = f"تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي {percent}%" if percent < 100 else "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي"
+                    if percent < 100:
+                        text_update = f"تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي {percent}%"
+                    else:
+                        text_update = "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي"
                     try:
                         loop = asyncio.get_event_loop()
                         loop.create_task(bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text_update))
@@ -182,10 +185,10 @@ async def process_queue(user_id, chat_id):
             except: pass
         user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id))
 
-@dp.message()
+@dp.message(F.content_type.any())
 async def message_handler(message: types.Message):
     user_id, chat_id = message.from_user.id, message.chat.id
-    text = message.text or ""
+    text = message.text or message.caption or ""
     url_match = re.search(r'https?://[^\s]+', text)
     
     if url_match:
