@@ -1,8 +1,2 @@
-[providers]
-python = {}
-
 [phases.setup]
-aptPkgs = ["ffmpeg"]
-
-[start]
-cmd = "python MediA.py"
+nixPkgs = ["python", "ffmpeg"]
