@@ -6,7 +6,7 @@ import mimetypes
 import yt_dlp
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ChatAction
-from aiogram.types import FSInputFile, InputMediaDocument, ReactionTypeEmoji
+from aiogram.types import FSInputFile, InputMediaDocument
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEVELOPER_ID = "8597653867"
@@ -17,7 +17,6 @@ dp = Dispatcher()
 user_queues = collections.defaultdict(list)
 user_processing = collections.defaultdict(bool)
 user_msg_counter = collections.defaultdict(lambda: 0)
-bot_msg_counter = collections.defaultdict(lambda: 0)
 
 last_reported_percent = collections.defaultdict(lambda: -10)
 
@@ -77,15 +76,6 @@ async def typing_effect(bot: Bot, chat_id, full_text: str, reply_markup=None, ex
     except:
         pass
     return message
-
-async def handle_reaction(bot: Bot, chat_id, message_id, emoji):
-    try: 
-        await bot.set_message_reaction(
-            chat_id=chat_id, 
-            message_id=message_id, 
-            reaction=[ReactionTypeEmoji(emoji=emoji)]
-        )
-    except: pass
 
 async def process_queue(user_id, chat_id):
     if user_processing[user_id] or not user_queues[user_id]: return
@@ -203,16 +193,10 @@ async def message_handler(message: types.Message):
     if url_match:
         if len(user_queues[user_id]) < 8:
             user_queues[user_id].append((url_match.group(0), message.message_id))
-            asyncio.create_task(handle_reaction(bot, chat_id, message.message_id, "🍌"))
             if not user_processing[user_id]: asyncio.create_task(process_queue(user_id, chat_id))
     else:
         user_msg_counter[user_id] += 1
         count = user_msg_counter[user_id]
-        reacts = ["🥰", "😭", "🍓", "😡"]
-        
-        asyncio.create_task(asyncio.sleep(1)).add_done_callback(
-            lambda _: asyncio.create_task(handle_reaction(bot, chat_id, message.message_id, reacts[(count-1) % 4]))
-        )
         
         reply_text = "اهلين دز رابط الميديا التريدها عزيزي\nيلا اوف" if count % 2 != 0 else "مو ناوي تستعملني مثل البوتات لو شنو\nترى اضوج"
         btn = get_developer_keyboard()
@@ -220,13 +204,6 @@ async def message_handler(message: types.Message):
         bot_msg = await typing_effect(bot, chat_id, reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
         if bot_msg:
             await bot.send_message(chat_id=chat_id, text="🫦" if count % 2 != 0 else "😡")
-            
-            bot_msg_counter[user_id] += 1
-            bot_reacts = ["😡", "🤣", "😭"]
-            
-            asyncio.create_task(asyncio.sleep(1)).add_done_callback(
-                lambda _, b_msg=bot_msg: asyncio.create_task(handle_reaction(bot, chat_id, b_msg.message_id, bot_reacts[(bot_msg_counter[user_id]-1) % 3]))
-            )
 
 async def main():
     await dp.start_polling(bot)
