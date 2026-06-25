@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python3", "ffmpeg"]
+nixPkgs = ["...", "ffmpeg"]
 
-[phases.start]
-cmds = ["python3 bot.py"]
+[start]
+cmd = "python MediA.py"
