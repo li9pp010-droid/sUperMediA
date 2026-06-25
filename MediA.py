@@ -17,11 +17,11 @@ dp = Dispatcher()
 user_queues = collections.defaultdict(list)
 user_processing = collections.defaultdict(bool)
 user_msg_counter = collections.defaultdict(lambda: 0)
-
 last_reported_percent = collections.defaultdict(lambda: -10)
 
 def filter_title(text):
-    if not text: return "Unknown"
+    if not text: 
+        return "Unknown"
     cleaned = re.sub(r'[\#\*\?\\/\|:\<\>"\']', '', text)
     cleaned = re.sub(r'[̀-ͯ҃-҉᷀-᷿⃐-⃿︠-︯]', '', cleaned)
     return cleaned.strip()
@@ -40,7 +40,9 @@ def get_developer_keyboard():
     )
 
 async def process_queue(user_id, chat_id):
-    if user_processing[user_id] or not user_queues[user_id]: return
+    if user_processing[user_id] or not user_queues[user_id]: 
+        return
+        
     user_processing[user_id] = True
     url, reply_msg_id = user_queues[user_id].pop(0)
     
@@ -60,7 +62,9 @@ async def process_queue(user_id, chat_id):
         btn = get_developer_keyboard()
         await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
-        user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id)); return
+        user_processing[user_id] = False
+        asyncio.create_task(process_queue(user_id, chat_id))
+        return
 
     await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     status_msg = await bot.send_message(chat_id=chat_id, text="تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
@@ -83,7 +87,8 @@ async def process_queue(user_id, chat_id):
                             loop.create_task(bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text_update))
                         else:
                             loop.create_task(bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id))
-                    except: pass
+                    except: 
+                        pass
 
     os.makedirs('downloads', exist_ok=True)
     ydl_opts = {
@@ -97,14 +102,18 @@ async def process_queue(user_id, chat_id):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl: 
             info = ydl.extract_info(url, download=True)
         
-        try: await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-        except: pass
+        try: 
+            await bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+        except: 
+            pass
 
         files = []
         if 'entries' in info:
             for entry in info['entries']: 
-                if entry: files.append(ydl.prepare_filename(entry))
-        else: files.append(ydl.prepare_filename(info))
+                if entry: 
+                    files.append(ydl.prepare_filename(entry))
+        else: 
+            files.append(ydl.prepare_filename(info))
         
         clean_files = []
         for f in files:
@@ -133,16 +142,20 @@ async def process_queue(user_id, chat_id):
             
             await bot.send_message(chat_id=chat_id, text="العملية صارت بدون مشاكل\nتفضل مولاي", reply_to_message_id=reply_msg_id)
             await bot.send_message(chat_id=chat_id, text="🍓")
-        else: raise Exception
+        else: 
+            raise Exception
     except:
         btn = get_developer_keyboard()
         await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
     finally:
         for f in os.listdir('downloads') if os.path.exists('downloads') else []: 
-            try: os.remove(os.path.join('downloads', f))
-            except: pass
-        user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id))
+            try: 
+                os.remove(os.path.join('downloads', f))
+            except: 
+                pass
+        user_processing[user_id] = False
+        asyncio.create_task(process_queue(user_id, chat_id))
 
 @dp.message(F.content_type.any())
 async def message_handler(message: types.Message):
@@ -153,7 +166,8 @@ async def message_handler(message: types.Message):
     if url_match:
         if len(user_queues[user_id]) < 8:
             user_queues[user_id].append((url_match.group(0), message.message_id))
-            if not user_processing[user_id]: asyncio.create_task(process_queue(user_id, chat_id))
+            if not user_processing[user_id]: 
+                asyncio.create_task(process_queue(user_id, chat_id))
     else:
         user_msg_counter[user_id] += 1
         count = user_msg_counter[user_id]
