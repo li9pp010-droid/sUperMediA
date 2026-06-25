@@ -19,6 +19,8 @@ user_processing = collections.defaultdict(bool)
 user_msg_counter = collections.defaultdict(lambda: 0)
 bot_msg_counter = collections.defaultdict(lambda: 0)
 
+last_reported_percent = collections.defaultdict(lambda: -10)
+
 def filter_title(text):
     if not text: return "Unknown"
     cleaned = re.sub(r'[\#\*\?\\/\|:\<\>"\']', '', text)
@@ -37,67 +39,6 @@ def get_developer_keyboard():
             ]
         ]
     )
-
-async def typing_effect(bot: Bot, chat_id, full_text: str, reply_markup=None, existing_message=None, reply_to_message_id=None):
-    lines = full_text.split('\n')
-    chunks = []
-    
-    for line_idx, line in enumerate(lines):
-        words = line.split(' ')
-        w_idx = 0
-        line_chunks = []
-        toggle = True
-        
-        while w_idx < len(words):
-            if toggle:
-                take_words = words[w_idx:w_idx+2]
-                valid_words = [w for w in take_words if w]
-                if valid_words:
-                    line_chunks.append(("words", " ".join(valid_words)))
-                w_idx += 2
-                toggle = False
-            else:
-                word = words[w_idx]
-                if not word:
-                    w_idx += 1
-                    continue
-                if len(word) <= 3:
-                    line_chunks.append(("letters", word))
-                    w_idx += 1
-                else:
-                    line_chunks.append(("letters", word[:3]))
-                    words[w_idx] = word[3:]
-                toggle = True
-        chunks.append((line_idx, line_chunks))
-    
-    current_lines = ["" for _ in range(len(lines))]
-    message = existing_message
-    
-    for line_idx, line_chunks in chunks:
-        for chunk_type, chunk in line_chunks:
-            if not chunk: continue
-            
-            if current_lines[line_idx]:
-                if chunk_type == "letters":
-                    current_lines[line_idx] += chunk
-                else:
-                    current_lines[line_idx] += " " + chunk
-            else:
-                current_lines[line_idx] = chunk
-            
-            visible_text = "\n".join(current_lines[:line_idx+1]).strip('\n')
-            
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            if message is None:
-                message = await bot.send_message(chat_id=chat_id, text=visible_text, reply_to_message_id=reply_to_message_id)
-            else:
-                try: await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=visible_text)
-                except: pass
-            await asyncio.sleep(0.3)
-            
-    try: await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=full_text, reply_markup=reply_markup)
-    except: pass
-    return message
 
 async def handle_reaction(bot: Bot, chat_id, message_id, emoji):
     try: 
@@ -127,24 +68,28 @@ async def process_queue(user_id, chat_id):
                 raise Exception
     except:
         btn = get_developer_keyboard()
-        err_msg = await typing_effect(bot, chat_id, "الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
+        await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
         user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id)); return
 
-    status_msg = await typing_effect(bot, chat_id, "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
+    status_msg = await bot.send_message(chat_id=chat_id, text="تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
     await bot.send_message(chat_id=chat_id, text="⏳")
     
+    last_reported_percent[user_id] = -10
+
     def progress_hook(d):
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes', 0)
             if total > 0:
                 percent = int((downloaded / total) * 100)
-                text_update = f"تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي {percent}%" if percent < 100 else "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي"
-                try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text_update))
-                except: pass
+                if percent >= last_reported_percent[user_id] + 10 or percent == 100:
+                    last_reported_percent[user_id] = percent
+                    text_update = f"تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي {percent}%" if percent < 100 else "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي"
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(bot.edit_message_text(chat_id=chat_id, message_id=status_msg.message_id, text=text_update))
+                    except: pass
 
     os.makedirs('downloads', exist_ok=True)
     ydl_opts = {
@@ -192,12 +137,12 @@ async def process_queue(user_id, chat_id):
                 else: 
                     await bot.send_document(chat_id=chat_id, document=FSInputFile(group[0], filename=os.path.basename(group[0])), reply_to_message_id=reply_msg_id)
             
-            await typing_effect(bot, chat_id, "العملية صارت بدون مشاكل\nتفضل مولاي", reply_to_message_id=reply_msg_id)
+            await bot.send_message(chat_id=chat_id, text="العملية صارت بدون مشاكل\nتفضل مولاي", reply_to_message_id=reply_msg_id)
             await bot.send_message(chat_id=chat_id, text="🍓")
         else: raise Exception
     except:
         btn = get_developer_keyboard()
-        await typing_effect(bot, chat_id, "الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
+        await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
     finally:
         for f in os.listdir('downloads') if os.path.exists('downloads') else []: 
@@ -227,7 +172,9 @@ async def message_handler(message: types.Message):
         
         reply_text = "اهلين دز رابط الميديا التريدها عزيزي\nيلا اوف" if count % 2 != 0 else "مو ناوي تستعملني مثل البوتات لو شنو\nترى اضوج"
         btn = get_developer_keyboard()
-        bot_msg = await typing_effect(bot, chat_id, reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
+        
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        bot_msg = await bot.send_message(chat_id=chat_id, text=reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
         await bot.send_message(chat_id=chat_id, text="🫦" if count % 2 != 0 else "😡")
         
         bot_msg_counter[user_id] += 1
