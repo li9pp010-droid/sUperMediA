@@ -55,10 +55,16 @@ async def typing_effect(bot: Bot, chat_id, full_text: str, reply_markup=None, ex
         else:
             current_text = chunk
             
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except:
+            pass
         
         if message is None:
-            message = await bot.send_message(chat_id=chat_id, text=current_text, reply_to_message_id=reply_to_message_id)
+            try:
+                message = await bot.send_message(chat_id=chat_id, text=current_text, reply_to_message_id=reply_to_message_id)
+            except:
+                return None
         else:
             try:
                 await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=current_text)
@@ -105,6 +111,9 @@ async def process_queue(user_id, chat_id):
         user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id)); return
 
     status_msg = await typing_effect(bot, chat_id, "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
+    if not status_msg:
+        user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id)); return
+        
     await bot.send_message(chat_id=chat_id, text="⏳")
     
     last_reported_percent[user_id] = -10
@@ -201,7 +210,7 @@ async def message_handler(message: types.Message):
         count = user_msg_counter[user_id]
         reacts = ["🥰", "😭", "🍓", "😡"]
         
-        asyncio.create_task(asyncio.sleep(3)).add_done_callback(
+        asyncio.create_task(asyncio.sleep(1)).add_done_callback(
             lambda _: asyncio.create_task(handle_reaction(bot, chat_id, message.message_id, reacts[(count-1) % 4]))
         )
         
@@ -209,14 +218,15 @@ async def message_handler(message: types.Message):
         btn = get_developer_keyboard()
         
         bot_msg = await typing_effect(bot, chat_id, reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
-        await bot.send_message(chat_id=chat_id, text="🫦" if count % 2 != 0 else "😡")
-        
-        bot_msg_counter[user_id] += 1
-        bot_reacts = ["😡", "🤣", "😭"]
-        
-        asyncio.create_task(asyncio.sleep(3)).add_done_callback(
-            lambda _, b_msg=bot_msg: asyncio.create_task(handle_reaction(bot, chat_id, b_msg.message_id, bot_reacts[(bot_msg_counter[user_id]-1) % 3]))
-        )
+        if bot_msg:
+            await bot.send_message(chat_id=chat_id, text="🫦" if count % 2 != 0 else "😡")
+            
+            bot_msg_counter[user_id] += 1
+            bot_reacts = ["😡", "🤣", "😭"]
+            
+            asyncio.create_task(asyncio.sleep(1)).add_done_callback(
+                lambda _, b_msg=bot_msg: asyncio.create_task(handle_reaction(bot, chat_id, b_msg.message_id, bot_reacts[(bot_msg_counter[user_id]-1) % 3]))
+            )
 
 async def main():
     await dp.start_polling(bot)
