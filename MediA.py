@@ -40,6 +40,38 @@ def get_developer_keyboard():
         ]
     )
 
+async def typing_effect(bot: Bot, chat_id, full_text: str, reply_markup=None, existing_message=None, reply_to_message_id=None):
+    words = [w for w in full_text.split(' ') if w]
+    chunks = []
+    for i in range(0, len(words), 2):
+        chunks.append(" ".join(words[i:i+2]))
+    
+    current_text = ""
+    message = existing_message
+    
+    for idx, chunk in enumerate(chunks):
+        if current_text:
+            current_text += " " + chunk
+        else:
+            current_text = chunk
+            
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        
+        if message is None:
+            message = await bot.send_message(chat_id=chat_id, text=current_text, reply_to_message_id=reply_to_message_id)
+        else:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=current_text)
+            except:
+                pass
+        await asyncio.sleep(0.3)
+        
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message.message_id, text=full_text, reply_markup=reply_markup)
+    except:
+        pass
+    return message
+
 async def handle_reaction(bot: Bot, chat_id, message_id, emoji):
     try: 
         await bot.set_message_reaction(
@@ -68,11 +100,11 @@ async def process_queue(user_id, chat_id):
                 raise Exception
     except:
         btn = get_developer_keyboard()
-        await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
+        await typing_effect(bot, chat_id, "الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
         user_processing[user_id] = False; asyncio.create_task(process_queue(user_id, chat_id)); return
 
-    status_msg = await bot.send_message(chat_id=chat_id, text="تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
+    status_msg = await typing_effect(bot, chat_id, "تم استلام الرابط والبدأ بتنزيل الميديا\nمولاي 0%", reply_to_message_id=reply_msg_id)
     await bot.send_message(chat_id=chat_id, text="⏳")
     
     last_reported_percent[user_id] = -10
@@ -137,12 +169,12 @@ async def process_queue(user_id, chat_id):
                 else: 
                     await bot.send_document(chat_id=chat_id, document=FSInputFile(group[0], filename=os.path.basename(group[0])), reply_to_message_id=reply_msg_id)
             
-            await bot.send_message(chat_id=chat_id, text="العملية صارت بدون مشاكل\nتفضل مولاي", reply_to_message_id=reply_msg_id)
+            await typing_effect(bot, chat_id, "العملية صارت بدون مشاكل\nتفضل مولاي", reply_to_message_id=reply_msg_id)
             await bot.send_message(chat_id=chat_id, text="🍓")
         else: raise Exception
     except:
         btn = get_developer_keyboard()
-        await bot.send_message(chat_id=chat_id, text="الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
+        await typing_effect(bot, chat_id, "الرابط مو مدعوم او الموقع مو\nمدعوم", reply_markup=btn, reply_to_message_id=reply_msg_id)
         await bot.send_message(chat_id=chat_id, text="👈🏻👉🏻")
     finally:
         for f in os.listdir('downloads') if os.path.exists('downloads') else []: 
@@ -173,8 +205,7 @@ async def message_handler(message: types.Message):
         reply_text = "اهلين دز رابط الميديا التريدها عزيزي\nيلا اوف" if count % 2 != 0 else "مو ناوي تستعملني مثل البوتات لو شنو\nترى اضوج"
         btn = get_developer_keyboard()
         
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        bot_msg = await bot.send_message(chat_id=chat_id, text=reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
+        bot_msg = await typing_effect(bot, chat_id, reply_text, reply_markup=btn, reply_to_message_id=message.message_id)
         await bot.send_message(chat_id=chat_id, text="🫦" if count % 2 != 0 else "😡")
         
         bot_msg_counter[user_id] += 1
